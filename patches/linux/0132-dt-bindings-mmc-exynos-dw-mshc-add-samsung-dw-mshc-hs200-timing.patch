@@ -1,0 +1,42 @@
+From b13a272add142c1d2de772f53a48274b9599046f Mon Sep 17 00:00:00 2001
+From: Alessandro Fontana <alessandro.fontana@pm.me>
+Date: Mon, 2 Nov 2026 14:18:53 +0100
+Subject: [PATCH] dt-bindings: mmc: exynos-dw-mshc: add
+ samsung,dw-mshc-hs200-timing
+
+HS200 uses the SDR timing, but vendor kernels program a different drive
+phase for it on some boards. Add an optional property for the HS200
+phases, with the SDR timing as the default.
+
+Assisted-by: LLM
+Signed-off-by: Alessandro Fontana <alessandro.fontana@pm.me>
+---
+ .../bindings/mmc/samsung,exynos-dw-mshc.yaml      | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/mmc/samsung,exynos-dw-mshc.yaml b/Documentation/devicetree/bindings/mmc/samsung,exynos-dw-mshc.yaml
+index b91a0a3b41..221c657501 100644
+--- a/Documentation/devicetree/bindings/mmc/samsung,exynos-dw-mshc.yaml
++++ b/Documentation/devicetree/bindings/mmc/samsung,exynos-dw-mshc.yaml
+@@ -73,6 +73,21 @@ properties:
+       phase shift value in receive mode for double data rate mode operation.
+       See also samsung,dw-mshc-hs400-timing property.
+ 
++  samsung,dw-mshc-hs200-timing:
++    $ref: /schemas/types.yaml#/definitions/uint32-array
++    items:
++      - description: CIU clock phase shift value for tx mode
++        minimum: 0
++        maximum: 7
++      - description: CIU clock phase shift value for rx mode
++        minimum: 0
++        maximum: 7
++    description:
++      The value of CIU TX and RX clock phase shift value for HS200 mode
++      operation, with the samsung,dw-mshc-ciu-div divider. The RX phase is
++      then found by tuning. If missing, values from
++      samsung,dw-mshc-sdr-timing property are used.
++
+   samsung,dw-mshc-hs400-timing:
+     $ref: /schemas/types.yaml#/definitions/uint32-array
+     items:

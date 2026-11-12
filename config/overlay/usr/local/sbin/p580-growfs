@@ -1,0 +1,10 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -eu
+dev=$(findmnt -n -o SOURCE /)
+case "$dev" in /dev/mmcblk*p[0-9]*) ;; *) echo 'Unexpected root device; filesystem resize refused.' >&2; exit 1;; esac
+label=$(blkid -s PARTLABEL -o value "$dev")
+[ "$label" = USERDATA ] || { echo 'Root partition is not USERDATA; filesystem resize refused.' >&2; exit 1; }
+resize2fs "$dev"
+mkdir -p /var/lib
+touch /var/lib/p580-grown

@@ -1,0 +1,131 @@
+From e720369cf1c69f47940285c9d86aaf0abab7bc43 Mon Sep 17 00:00:00 2001
+From: Alessandro Fontana <alessandro.fontana@pm.me>
+Date: Mon, 2 Nov 2026 14:19:08 +0100
+Subject: [PATCH] mmc: dw_mmc-exynos: support the HS400 ultra low power mode
+
+With samsung,hs400-ulp-mode, run HS400 as the vendor kernels of some
+Exynos 7870 boards do: the HS400 timing keeps the CIU divider of the
+other modes instead of the fixed divider of 1, the CIU clock is not
+doubled, CLKSEL bits 30 and 19 are set, and the read strobe delay line
+is written as a whole, with a FIFO clock delay of 2 and no write delay.
+The two CLKSEL bits are cleared when another timing is programmed.
+
+On gtaxlwifi the plain HS400 setup, with the CIU clock doubled, fails on
+some of the eMMC chips fitted to the board, which the vendor kernel
+reads normally.
+
+Assisted-by: LLM
+Signed-off-by: Alessandro Fontana <alessandro.fontana@pm.me>
+---
+ drivers/mmc/host/dw_mmc-exynos.c | 41 +++++++++++++++++++++++++++-----
+ drivers/mmc/host/dw_mmc-exynos.h |  3 +++
+ 2 files changed, 38 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/mmc/host/dw_mmc-exynos.c b/drivers/mmc/host/dw_mmc-exynos.c
+index 8c6b184049..5204af646f 100644
+--- a/drivers/mmc/host/dw_mmc-exynos.c
++++ b/drivers/mmc/host/dw_mmc-exynos.c
+@@ -41,6 +41,7 @@ struct dw_mci_exynos_priv_data {
+ 	u32				ddr_timing;
+ 	u32				hs200_timing;	/* 0: use sdr_timing */
+ 	u32				hs400_timing;
++	bool				hs400_ulp;
+ 	u32				tuned_sample;
+ 	u32				cur_speed;
+ 	u32				dqs_delay;
+@@ -175,7 +176,11 @@ static void dw_mci_exynos_set_clksel_timing(struct dw_mci *host, u32 timing)
+ 	else
+ 		clksel = mci_readl(host, CLKSEL);
+ 
+-	clksel = (clksel & ~SDMMC_CLKSEL_TIMING_MASK) | timing;
++	clksel &= ~SDMMC_CLKSEL_TIMING_MASK;
++	/* the ultra low power bits belong to the HS400 timing only */
++	if (priv->hs400_ulp)
++		clksel &= ~SDMMC_CLKSEL_ULP;
++	clksel |= timing;
+ 
+ 	if (priv->ctrl_type == DW_MCI_TYPE_EXYNOS7 ||
+ 		priv->ctrl_type == DW_MCI_TYPE_EXYNOS7_SMU ||
+@@ -318,7 +323,16 @@ static void dw_mci_exynos_config_hs400(struct dw_mci *host,
+ 
+ 	if (timing == MMC_TIMING_MMC_HS400) {
+ 		dqs |= DATA_STROBE_EN;
+-		strobe = DQS_CTRL_RD_DELAY(strobe, priv->dqs_delay);
++		/*
++		 * In the ultra low power mode the vendor kernel writes the whole
++		 * delay line: FIFO clock delay 2, the read delay, and no write
++		 * delay, whatever the bootloader left.
++		 */
++		if (priv->hs400_ulp)
++			strobe = DQS_CTRL_FIFO_CLK_DELAY(2) |
++				 DQS_CTRL_RD_DELAY(0, priv->dqs_delay);
++		else
++			strobe = DQS_CTRL_RD_DELAY(strobe, priv->dqs_delay);
+ 		/*
+ 		 * The bootloader leaves the write CRC status timer tuned for
+ 		 * the speeds it runs at; the vendor kernel sets it for DDR200
+@@ -385,7 +399,12 @@ static void dw_mci_exynos_set_ios(struct dw_mci *host, struct mmc_ios *ios)
+ 		/* Update tuned sample timing */
+ 		clksel = SDMMC_CLKSEL_UP_SAMPLE(
+ 				priv->hs400_timing, priv->tuned_sample);
+-		wanted <<= 1;
++		/*
++		 * Double data rate from the CIU clock, unless the controller
++		 * runs HS400 in its ultra low power mode at the HS200 rate.
++		 */
++		if (!priv->hs400_ulp)
++			wanted <<= 1;
+ 		break;
+ 	case MMC_TIMING_MMC_HS200:
+ 		if (priv->hs200_timing)
+@@ -477,8 +496,17 @@ static int dw_mci_exynos_parse_dt(struct dw_mci *host)
+ 		dev_dbg(host->dev,
+ 			"read-strobe-delay is not found, assuming usage of default value\n");
+ 
+-	priv->hs400_timing = SDMMC_CLKSEL_TIMING(timing[0], timing[1],
+-						HS400_FIXED_CIU_CLK_DIV);
++	/*
++	 * In the ultra low power mode HS400 keeps the CIU divider of the
++	 * other modes, and the CIU clock is not doubled.
++	 */
++	priv->hs400_ulp = of_property_read_bool(np, "samsung,hs400-ulp-mode");
++	if (priv->hs400_ulp)
++		priv->hs400_timing = SDMMC_CLKSEL_TIMING(timing[0], timing[1], div) |
++				     SDMMC_CLKSEL_ULP;
++	else
++		priv->hs400_timing = SDMMC_CLKSEL_TIMING(timing[0], timing[1],
++							HS400_FIXED_CIU_CLK_DIV);
+ 
+ 	if (!of_property_read_u32_array(np, "samsung,dw-mshc-hs200-timing",
+ 					timing, 2))
+@@ -638,7 +666,8 @@ static int dw_mci_exynos_prepare_hs400_tuning(struct dw_mci *host,
+ 	struct dw_mci_exynos_priv_data *priv = host->priv;
+ 
+ 	dw_mci_exynos_set_clksel_timing(host, priv->hs400_timing);
+-	dw_mci_exynos_adjust_clock(host, (ios->clock) << 1);
++	dw_mci_exynos_adjust_clock(host, priv->hs400_ulp ? ios->clock :
++				   (ios->clock) << 1);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/mmc/host/dw_mmc-exynos.h b/drivers/mmc/host/dw_mmc-exynos.h
+index 97e99c1e87..05e399db08 100644
+--- a/drivers/mmc/host/dw_mmc-exynos.h
++++ b/drivers/mmc/host/dw_mmc-exynos.h
+@@ -29,6 +29,8 @@
+ 					 SDMMC_CLKSEL_CCLK_DIVIDER(z))
+ #define SDMMC_CLKSEL_TIMING_MASK	SDMMC_CLKSEL_TIMING(0x7, 0x7, 0x7)
+ #define SDMMC_CLKSEL_WAKEUP_INT		BIT(11)
++/* HS400 ultra low power mode, as set by the vendor kernels */
++#define SDMMC_CLKSEL_ULP		(BIT(30) | BIT(19))
+ 
+ /* RCLK_EN register defines */
+ #define DATA_STROBE_EN			BIT(0)
+@@ -42,6 +44,7 @@
+ /* DLINE_CTRL register defines */
+ #define DQS_CTRL_RD_DELAY(x, y)		(((x) & ~0x3FF) | ((y) & 0x3FF))
+ #define DQS_CTRL_GET_RD_DELAY(x)	((x) & 0x3FF)
++#define DQS_CTRL_FIFO_CLK_DELAY(x)	(((x) & 0x3) << 16)
+ 
+ /* Protector Register */
+ #define SDMMC_EMMCP_BASE	0x1000

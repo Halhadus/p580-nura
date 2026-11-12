@@ -1,0 +1,237 @@
+From e75a7da05f284c4014752d0ab92b67dd38fc0b89 Mon Sep 17 00:00:00 2001
+From: Alessandro Fontana <alessandro.fontana@pm.me>
+Date: Wed, 23 Sep 2026 18:04:13 +0200
+Subject: [PATCH] drm/exynos: release the old framebuffers when the flip is
+ done
+
+drm_atomic_helper_commit_tail_rpm() waits for one vblank after the
+flush and then lets cleanup_planes() drop the old framebuffers. That is
+only right if the hardware always takes the new configuration at the
+vblank that follows the flush. On the Exynos7870 DECON it does not: the
+windows are programmed through shadow registers, which the block copies
+into the active ones at a vblank once DECON_UPDATE_STANDALONE_F is set,
+and a flush that lands close enough to the vblank misses it. The block
+scans the old buffers for one more frame, the event has already gone
+out, and the old framebuffers are released: on Android the hardware
+composer closes the last reference to the outgoing dma-buf, its IOMMU
+mapping is torn down while DECON is still fetching it, and the SysMMU
+takes an unrecoverable page fault.
+
+Make the completion follow the hardware:
+
+- exynos_drm uses its own commit tail, identical to the _rpm helper
+  except that it waits for flip_done instead of a vblank before
+  cleanup_planes(). Every exynos CRTC driver sends the commit's event
+  from its vblank handler, so nothing changes for a driver that arms
+  the event at flush time.
+
+- decon7 holds the event back and sends it from the vblank handler at
+  the first vblank that finds STANDALONE_F clear: the bit is a
+  self-clearing trigger, cleared once the update has been applied. The
+  vblank is still counted at every interrupt, so vblank timestamps and
+  waiters are not affected; only the event, its out-fence and the
+  cleanup follow the latch. A commit that has not latched after four
+  vblanks is completed anyway with a warning, rather than left to the
+  ten second flip_done timeout, and a pending event is completed when
+  the CRTC is disabled. The i80 interface, which does not count vblanks
+  in this driver, keeps arming the event at flush time.
+
+Assisted-by: LLM
+Signed-off-by: Alessandro Fontana <alessandro.fontana@pm.me>
+---
+ drivers/gpu/drm/exynos/exynos7_drm_decon.c | 113 ++++++++++++++++++++-
+ drivers/gpu/drm/exynos/exynos_drm_fb.c     |  28 ++++-
+ 2 files changed, 139 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/exynos/exynos7_drm_decon.c b/drivers/gpu/drm/exynos/exynos7_drm_decon.c
+index 0485b731d0..9456c75620 100644
+--- a/drivers/gpu/drm/exynos/exynos7_drm_decon.c
++++ b/drivers/gpu/drm/exynos/exynos7_drm_decon.c
+@@ -77,6 +77,14 @@ struct decon_context {
+ 	atomic_t			wait_vsync_event;
+ 	unsigned long			underrun_count;
+ 
++	/*
++	 * The event of the last commit, held until the shadow registers
++	 * have latched it, and the vblanks it has waited so far. Both under
++	 * drm_dev->event_lock.
++	 */
++	struct drm_pending_vblank_event	*event;
++	unsigned int			event_vblanks;
++
+ 	const struct decon_data *data;
+ 	struct drm_encoder *encoder;
+ };
+@@ -625,6 +633,102 @@ static void decon_start_scanout(struct decon_context *ctx)
+ 	ctx->scanout_on = true;
+ }
+ 
++/*
++ * How many vblanks a commit may wait for its registers to latch before it is
++ * completed anyway with a warning, rather than stalling until the flip_done
++ * timeout. Two covers a flush that missed the vblank.
++ */
++#define DECON_LATCH_MAX_VBLANKS	4
++
++/*
++ * Hold the commit's event until the shadow registers have really latched.
++ *
++ * DECON_UPDATE_STANDALONE_F is set once the windows are programmed and
++ * cleared by the block when it copies the shadow registers into the active
++ * ones, at a vblank. A flush that lands close to the vblank misses it and
++ * the old buffers are scanned out for one more frame: completing the commit
++ * at that interrupt would release them while they are still fetched, and
++ * the SysMMU faults. The event is therefore sent from the vblank handler at
++ * the first vblank that finds the bit clear.
++ */
++static void decon_queue_event(struct decon_context *ctx)
++{
++	struct drm_crtc *crtc = &ctx->crtc->base;
++	struct drm_pending_vblank_event *event = crtc->state->event;
++	unsigned long flags;
++	int ret;
++
++	if (!event)
++		return;
++	crtc->state->event = NULL;
++
++	ret = drm_crtc_vblank_get(crtc);
++
++	spin_lock_irqsave(&crtc->dev->event_lock, flags);
++	if (WARN_ON(ret != 0)) {
++		/* no vblank interrupt to wait for */
++		drm_crtc_send_vblank_event(crtc, event);
++	} else {
++		WARN_ON(ctx->event);
++		ctx->event = event;
++		ctx->event_vblanks = 0;
++	}
++	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
++}
++
++/* From the vblank interrupt, after the vblank has been counted. */
++static void decon_handle_event(struct decon_context *ctx)
++{
++	struct drm_crtc *crtc = &ctx->crtc->base;
++	struct drm_pending_vblank_event *event;
++	bool latched;
++
++	spin_lock(&crtc->dev->event_lock);
++
++	event = ctx->event;
++	if (!event) {
++		spin_unlock(&crtc->dev->event_lock);
++		return;
++	}
++
++	latched = !(readl(ctx->regs + DECON_UPDATE) &
++		    DECON_UPDATE_STANDALONE_F);
++	if (!latched && ++ctx->event_vblanks < DECON_LATCH_MAX_VBLANKS) {
++		spin_unlock(&crtc->dev->event_lock);
++		return;
++	}
++
++	if (!latched)
++		dev_warn_ratelimited(ctx->dev,
++				     "update not latched after %u vblanks, completing the commit anyway\n",
++				     ctx->event_vblanks);
++
++	ctx->event = NULL;
++	drm_crtc_send_vblank_event(crtc, event);
++
++	spin_unlock(&crtc->dev->event_lock);
++
++	drm_crtc_vblank_put(crtc);
++}
++
++/* Nothing will latch once the block is off: complete what is left. */
++static void decon_flush_event(struct decon_context *ctx)
++{
++	struct drm_crtc *crtc = &ctx->crtc->base;
++	struct drm_pending_vblank_event *event;
++	unsigned long flags;
++
++	spin_lock_irqsave(&crtc->dev->event_lock, flags);
++	event = ctx->event;
++	ctx->event = NULL;
++	if (event)
++		drm_crtc_send_vblank_event(crtc, event);
++	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
++
++	if (event)
++		drm_crtc_vblank_put(crtc);
++}
++
+ static void decon_atomic_flush(struct exynos_drm_crtc *crtc)
+ {
+ 	struct decon_context *ctx = crtc->ctx;
+@@ -635,7 +739,11 @@ static void decon_atomic_flush(struct exynos_drm_crtc *crtc)
+ 
+ 	decon_start_scanout(ctx);
+ 
+-	exynos_crtc_handle_event(crtc);
++	/* the i80 interface does not count vblanks in this driver */
++	if (ctx->i80_if)
++		exynos_crtc_handle_event(crtc);
++	else
++		decon_queue_event(ctx);
+ }
+ 
+ /*
+@@ -762,6 +870,8 @@ static void decon_atomic_disable(struct exynos_drm_crtc *crtc)
+ 	u32 val;
+ 	int i;
+ 
++	decon_flush_event(ctx);
++
+ 	/*
+ 	 * We need to make sure that all windows are disabled before we
+ 	 * suspend that connector. Otherwise we might try to scan from
+@@ -832,6 +942,7 @@ static irqreturn_t decon_irq_handler(int irq, void *dev_id)
+ 
+ 	if (!ctx->i80_if) {
+ 		drm_crtc_handle_vblank(&ctx->crtc->base);
++		decon_handle_event(ctx);
+ 
+ 		/* set wait vsync event to zero and wake up queue. */
+ 		if (atomic_read(&ctx->wait_vsync_event)) {
+diff --git a/drivers/gpu/drm/exynos/exynos_drm_fb.c b/drivers/gpu/drm/exynos/exynos_drm_fb.c
+index 4cff2b2b63..98e529a323 100644
+--- a/drivers/gpu/drm/exynos/exynos_drm_fb.c
++++ b/drivers/gpu/drm/exynos/exynos_drm_fb.c
+@@ -153,8 +153,34 @@ dma_addr_t exynos_drm_fb_dma_addr(struct drm_framebuffer *fb, int index)
+ 	return exynos_gem->dma_addr + fb->offsets[index];
+ }
+ 
++/*
++ * drm_atomic_helper_commit_tail_rpm(), except that the old framebuffers are
++ * released once the flip is done rather than after the next vblank: a CRTC
++ * whose shadow registers can miss that vblank holds the event back until
++ * they have latched, and until then the old buffers are still fetched.
++ */
++static void exynos_drm_atomic_commit_tail(struct drm_atomic_commit *state)
++{
++	struct drm_device *dev = state->dev;
++
++	drm_atomic_helper_commit_modeset_disables(dev, state);
++
++	drm_atomic_helper_commit_modeset_enables(dev, state);
++
++	drm_atomic_helper_commit_planes(dev, state,
++					DRM_PLANE_COMMIT_ACTIVE_ONLY);
++
++	drm_atomic_helper_fake_vblank(state);
++
++	drm_atomic_helper_commit_hw_done(state);
++
++	drm_atomic_helper_wait_for_flip_done(dev, state);
++
++	drm_atomic_helper_cleanup_planes(dev, state);
++}
++
+ static struct drm_mode_config_helper_funcs exynos_drm_mode_config_helpers = {
+-	.atomic_commit_tail = drm_atomic_helper_commit_tail_rpm,
++	.atomic_commit_tail = exynos_drm_atomic_commit_tail,
+ };
+ 
+ static const struct drm_mode_config_funcs exynos_drm_mode_config_funcs = {

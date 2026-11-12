@@ -1,0 +1,35 @@
+From 3f9e93b78f10c833d6fd33bba7e498e20170dc16 Mon Sep 17 00:00:00 2001
+From: Alessandro Fontana <alessandro.fontana@pm.me>
+Date: Mon, 2 Nov 2026 14:19:08 +0100
+Subject: [PATCH] dt-bindings: mmc: exynos-dw-mshc: add samsung,hs400-ulp-mode
+
+The vendor kernels of some Exynos 7870 boards run HS400 in an ultra low
+power mode of the controller, with the CIU clock not doubled. Add a
+property to select it.
+
+Assisted-by: LLM
+Signed-off-by: Alessandro Fontana <alessandro.fontana@pm.me>
+---
+ .../devicetree/bindings/mmc/samsung,exynos-dw-mshc.yaml  | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/mmc/samsung,exynos-dw-mshc.yaml b/Documentation/devicetree/bindings/mmc/samsung,exynos-dw-mshc.yaml
+index 221c657501..6918479ccc 100644
+--- a/Documentation/devicetree/bindings/mmc/samsung,exynos-dw-mshc.yaml
++++ b/Documentation/devicetree/bindings/mmc/samsung,exynos-dw-mshc.yaml
+@@ -149,6 +149,15 @@ properties:
+       it in HS200, for boards where samsung,read-strobe-delay is known to work
+       only with enhanced strobe.
+ 
++  samsung,hs400-ulp-mode:
++    type: boolean
++    description:
++      Run HS400 in the ultra low power mode of the controller, as the vendor
++      kernels of some Exynos 7870 boards do. The CIU clock keeps the
++      samsung,dw-mshc-ciu-div divider of the other modes instead of being
++      doubled, samsung,dw-mshc-hs400-timing applies with that divider, and
++      the read strobe delay line is programmed as a whole.
++
+ required:
+   - compatible
+   - reg

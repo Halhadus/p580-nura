@@ -1,0 +1,1252 @@
+From: Halhadus <eneshakans45@proton.me>
+Subject: [PATCH] board: samsung: add SM-P580 boot support
+
+Signed-off-by: Halhadus <eneshakans45@proton.me>
+---
+diff --git a/arch/arm/dts/exynos7870-gtanotexlwifi-u-boot.dtsi b/arch/arm/dts/exynos7870-gtanotexlwifi-u-boot.dtsi
+new file mode 100644
+--- /dev/null
++++ b/arch/arm/dts/exynos7870-gtanotexlwifi-u-boot.dtsi
+@@ -0,0 +1,31 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (c) Kaustabh Chakraborty <kauschluss@disroot.org>
++ */
++
++/ {
++	/* These properties are required by S-BOOT. */
++	model_info-chip = <7870>;
++	model_info-hw_rev = <0>;
++	model_info-hw_rev_end = <255>;
++
++	/*
++	 * S-BOOT will populate the memory nodes stated below. Existing
++	 * values redefine the safe memory requirements as stated in upstream
++	 * device tree, in separate nodes for each bank.
++	 */
++	memory@40000000 {
++		device_type = "memory";
++		reg = <0x0 0x40000000 0x3d800000>;
++	};
++
++	memory@80000000 {
++		device_type = "memory";
++		reg = <0x0 0x80000000 0x80000000>;
++	};
++
++	memory@100000000 {
++		device_type = "memory";
++		reg = <0x1 0x00000000 0x00000000>;
++	};
++};
+diff --git a/board/samsung/exynos-mobile/Makefile b/board/samsung/exynos-mobile/Makefile
+--- a/board/samsung/exynos-mobile/Makefile
++++ b/board/samsung/exynos-mobile/Makefile
+@@ -2,4 +2,4 @@
+ #
+ # Copyright (C) 2025 Kaustabh Chakraborty <kauschluss@disroot.org>
+ 
+-obj-y := exynos-mobile.o
++obj-y := exynos-mobile.o p580-asv.o
+diff --git a/board/samsung/exynos-mobile/exynos-mobile.c b/board/samsung/exynos-mobile/exynos-mobile.c
+--- a/board/samsung/exynos-mobile/exynos-mobile.c
++++ b/board/samsung/exynos-mobile/exynos-mobile.c
+@@ -13,6 +13,8 @@
+ #include <efi.h>
+ #include <efi_loader.h>
+ #include <env.h>
++#include <fdt_support.h>
++#include "p580-asv.h"
+ #include <errno.h>
+ #include <init.h>
+ #include <linux/sizes.h>
+@@ -228,7 +230,7 @@
+ 			update_info.dfu_string = dfu_string;
+ 		}
+ 
+-		if (info.start > largest_part_size) {
++		if (!strcasecmp(info.name, "USERDATA")) {
+ 			largest_part_start = info.start;
+ 			largest_part_size = info.size;
+ 		}
+@@ -370,3 +372,8 @@
+ 
+ 	return exynos_fastboot_setup();
+ }
++
++int ft_board_setup(void *blob, struct bd_info *bd)
++{
++	return p580_asv_fixup(blob);
++}
+diff --git a/board/samsung/exynos-mobile/exynos-mobile.env b/board/samsung/exynos-mobile/exynos-mobile.env
+--- a/board/samsung/exynos-mobile/exynos-mobile.env
++++ b/board/samsung/exynos-mobile/exynos-mobile.env
+@@ -1,6 +1,6 @@
+-stdin=serial,button-kbd
+-stdout=serial,vidconsole
+-stderr=serial,vidconsole
++stdin=serial
++stdout=serial
++stderr=serial
+ 
+ blkmapcmd=blkmap create root;
+ 	  blkmap map root 0 ${blkmap_size_r} linear ${blkmap_blk_ifname} ${blkmap_blk_dev} ${blkmap_blk_nr}
+@@ -8,7 +8,7 @@
+ preboot=run blkmapcmd
+ 
+ bootdelay=0
+-bootcmd=bootefi bootmgr; pause; bootmenu
++bootcmd=bootefi bootmgr; bootmenu
+ 
+ fastbootcmd=echo "Fastboot Mode";
+ 	fastboot -l $fastboot_addr_r usb 0
+diff --git a/board/samsung/exynos-mobile/p580-asv.c b/board/samsung/exynos-mobile/p580-asv.c
+new file mode 100644
+--- /dev/null
++++ b/board/samsung/exynos-mobile/p580-asv.c
+@@ -0,0 +1,410 @@
++/*
++ * SPDX-FileCopyrightText: 2026 The LineageOS Project
++ * SPDX-License-Identifier: GPL-2.0-only
++ *
++ *
++ * CPU and GPU voltages for this very chip, as the stock kernel picks them
++ * (pwrcal, S5E7870-asv.c). Every Exynos 7870 is binned at the factory: the
++ * ASV fuses give its group and the table version, and the ECT, which S-BOOT
++ * leaves in RAM, holds the voltage of every level for every group, plus the
++ * sub-group corrections (SSA). The DTB carries the voltages of one unit; here
++ * they are replaced, OPP by OPP, with the ones of the unit we run on.
++ *
++ * The GPU rail, BUCK2, also supplies MIF (the memory controller), INT and
++ * DISP: the stock devfreq drivers of those domains ask BUCK2 for their own
++ * voltages (exynos7870.dtsi, reg_name "BUCK2"), and the regulator keeps the
++ * highest request. Here the GPU is the only consumer, while MIF and INT run
++ * at the clocks S-BOOT left (MIF at 902 MHz), so no GPU OPP may ask for less
++ * than the highest level of those three domains on this chip. Below that,
++ * the memory controller and the bus run undervolted as soon as the GPU
++ * driver probes: random corruption, or a hard hang, on chips with less
++ * margin.
++ *
++ * Everything is computed first and written only if every OPP found its
++ * voltage: anything missing or out of range leaves the DTB as it is.
++ */
++
++#include <stdio.h>
++#include <linux/errno.h>
++#include <linux/libfdt.h>
++#include <linux/types.h>
++#include <string.h>
++#include "p580-asv.h"
++
++static void *asv_fdt;
++
++static void asv_log(const char *tag, unsigned long value)
++{
++	char message[64];
++	int chosen = fdt_path_offset(asv_fdt, "/chosen");
++
++	snprintf(message, sizeof(message), "%s=%lx", tag, value);
++	printf("P580 ASV: %s\n", message);
++	if (chosen >= 0)
++		fdt_setprop_string(asv_fdt, chosen, "samsung,p580-asv-error", message);
++}
++
++#define ECT_ADDR	0x90000000UL	/* reserved as ect@90000000 in the DTB */
++#define ECT_SIZE	0x14000UL
++#define ASV_FUSES	0x100D9000UL	/* secure only: read through the monitor */
++#define SMC_CMD_REG	0xFFFFFF9BUL
++#define SMC_SFR_READ	0xC0000000UL
++
++#define VOLT_STEP	6250		/* compact ASV tables: u8 x 6.25 mV */
++#define VOLT_MARGIN	25000		/* as the DTB: COLD_VOLT_OFFSET, Mali */
++#define VOLT_MIN	500000
++#define VOLT_MAX	1300000
++#define MAX_OPPS	20
++
++static const struct {
++	const char *ect;	/* ASV domain */
++	const char *ssa;	/* GEN table with its SSA parameters */
++	unsigned int fuse;	/* 16-bit field in the fuse words */
++	const char *path;	/* OPP table in the DTB */
++} domains[] = {
++	{ "dvfs_cpucl0", "SSA_CPUCL0", 0, "/opp-table-cpucl0" },
++	{ "dvfs_cpucl1", "SSA_CPUCL1", 1, "/opp-table-cpucl1" },
++	{ "dvfs_g3d", "SSA_G3D", 2, "/soc@0/gpu@11400000/opp-table" },
++};
++
++#define NDOM (sizeof(domains) / sizeof(domains[0]))
++#define DOM_G3D 2
++
++/* domains sharing BUCK2 with the GPU, with no DVFS of their own here */
++static const struct {
++	const char *ect, *ssa;
++	unsigned int fuse;
++} rail[] = {
++	{ "dvfs_mif", "SSA_MIF", 3 },
++	{ "dvfs_int", "SSA_INT", 4 },
++	{ "dvfs_disp", "SSA_DISP", 5 },
++};
++
++#define NRAIL (sizeof(rail) / sizeof(rail[0]))
++
++static const unsigned char *ect = (const unsigned char *)ECT_ADDR;
++
++static int smc_read(unsigned long addr, u32 *val)
++{
++	register unsigned long x0 asm("x0") = SMC_CMD_REG;
++	register unsigned long x1 asm("x1") = SMC_SFR_READ | (addr >> 2);
++	register unsigned long x2 asm("x2") = 0;
++	register unsigned long x3 asm("x3") = 0;
++
++	asm volatile("smc #0"
++		     : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
++		     :
++		     : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
++		       "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	if (x0)
++		return -1;
++	*val = x2;
++	return 0;
++}
++
++/* bounds-checked little-endian reads inside the ECT */
++static int u32_at(unsigned long off, u32 *v)
++{
++	if (off + 4 > ECT_SIZE)
++		return -1;
++	*v = ect[off] | ect[off + 1] << 8 | ect[off + 2] << 16 | (u32)ect[off + 3] << 24;
++	return 0;
++}
++
++/* an ECT string: u32 length, the bytes and a NUL, padded to 4 */
++static int str_at(unsigned long *off, const char **s)
++{
++	u32 len;
++
++	if (u32_at(*off, &len) || len > 64 || *off + 4 + len + 1 > ECT_SIZE)
++		return -1;
++	*s = (const char *)ect + *off + 4;
++	len += 1;
++	*off += 4 + ((len + 3) & ~3u);
++	return 0;
++}
++
++/*
++ * Offset of entry name in a directory: the ECT header (from offset 12) or
++ * a block (from offset 8, after parser version and version string).
++ * Returns the offset, relative to rel, or 0.
++ */
++static unsigned long find(unsigned long dir, unsigned long rel, const char *name)
++{
++	u32 n, o, i;
++	const char *s;
++
++	if (u32_at(dir, &n) || n > 64)
++		return 0;
++	dir += 4;
++	for (i = 0; i < n; i++) {
++		if (str_at(&dir, &s) || u32_at(dir, &o))
++			return 0;
++		dir += 4;
++		if (!strncmp(s, name, strlen(name) + 1))
++			return o && rel + o < ECT_SIZE ? rel + o : 0;
++	}
++	return 0;
++}
++
++struct asv_domain {
++	u32 ngrp, nlev;
++	unsigned long levels;	/* u32[nlev], MHz */
++	unsigned long volts;	/* u8[nlev][ngrp] of the table version */
++	u32 subgrp, base, step, ssa1[8];
++};
++
++static int load_domain(unsigned long asv, unsigned long gen, const char *dom,
++		       const char *ssa, u32 ver, struct asv_domain *a)
++{
++	unsigned long off, p;
++	u32 ntab, ncol, nrow, t, i;
++
++	off = find(asv + 8, asv, dom);
++	if (!off || u32_at(off, &a->ngrp) || u32_at(off + 4, &a->nlev) ||
++	    u32_at(off + 8, &ntab) || !a->ngrp || a->ngrp > 32 ||
++	    !a->nlev || a->nlev > 64 || !ntab || ntab > 16 ||
++	    (a->nlev * a->ngrp) % 4)	/* no padding between compact tables */
++		return -1;
++	a->levels = off + 12;
++	off = a->levels + 4 * a->nlev;
++	if (ver >= ntab)
++		ver = ntab - 1;	/* as asv_set_freq_limit() */
++	for (t = 0; ; t++) {
++		off += 4 + 8 + 4 * a->nlev;	/* version, boot/resume, level_en */
++		if (t == ver)
++			break;
++		off += a->nlev * a->ngrp;
++	}
++	a->volts = off;
++	if (off + a->nlev * a->ngrp > ECT_SIZE)
++		return -1;
++
++	p = find(gen + 8, gen, ssa);
++	if (!p || u32_at(p, &ncol) || u32_at(p + 4, &nrow) || ncol < 12 || ver >= nrow)
++		return -1;
++	p += 8 + 4 * ver * ncol;
++	if (u32_at(p + 4, &a->subgrp) || u32_at(p + 8, &a->base) || u32_at(p + 12, &a->step))
++		return -1;
++	for (i = 0; i < 8; i++)
++		if (u32_at(p + 16 + 4 * i, &a->ssa1[i]))
++			return -1;
++	return 0;
++}
++
++/* get_asv_voltage() of the stock kernel, for the level at mhz */
++static int voltage(const struct asv_domain *a, u32 field, u32 mhz, u32 *uv)
++{
++	int grp = field & 0xf, mod = (field >> 4) & 0xf;
++	unsigned int ssa10 = (field >> 8) & 3, ssa11 = (field >> 10) & 3;
++	unsigned int ssa0 = (field >> 12) & 0xf;
++	u32 lv, f, v;
++
++	if (mod >= 8)
++		mod -= 16;
++	grp += mod;
++	if (grp < 0 || grp >= (int)a->ngrp)
++		return -1;
++	for (lv = 0; lv < a->nlev; lv++)
++		if (!u32_at(a->levels + 4 * lv, &f) && f == mhz)
++			break;
++	if (lv == a->nlev)
++		return -1;
++	v = ect[a->volts + lv * a->ngrp + grp] * VOLT_STEP;
++	v += lv < a->subgrp ? a->ssa1[ssa10] : a->ssa1[ssa11 + 4];
++	if (a->base && v < a->base + ssa0 * a->step)
++		v = a->base + ssa0 * a->step;
++	*uv = v;
++	return 0;
++}
++
++/* the highest voltage of any level of the domain */
++static int max_voltage(const struct asv_domain *a, u32 field, u32 *uv)
++{
++	u32 lv, f, v;
++
++	*uv = 0;
++	for (lv = 0; lv < a->nlev; lv++) {
++		if (u32_at(a->levels + 4 * lv, &f) || voltage(a, field, f, &v))
++			return -1;
++		if (v > *uv)
++			*uv = v;
++	}
++	return 0;
++}
++
++/* the 16-bit fuse field of a domain; 0 on unfused parts */
++static u32 fuse_field(const u32 *w, unsigned int idx)
++{
++	if (!((w[3] >> 7) & 1))
++		return 0;
++	return (w[idx / 2] >> (16 * (idx % 2))) & 0xffff;
++}
++
++static u32 be32(const void *p)
++{
++	const unsigned char *b = p;
++
++	return (u32)b[0] << 24 | b[1] << 16 | b[2] << 8 | b[3];
++}
++
++static void put_be32(void *p, u32 v)
++{
++	unsigned char *b = p;
++
++	b[0] = v >> 24;
++	b[1] = v >> 16;
++	b[2] = v >> 8;
++	b[3] = v;
++}
++
++static int apply_asv(void *fdt)
++{
++	static struct {
++		int node, cells;
++		u32 uv;
++	} opp[NDOM * MAX_OPPS];
++	struct asv_domain a;
++	u32 w[4], ver, pv, field, floor = 0, uv;
++	unsigned long asv, gen;
++	unsigned int d, n = 0, i, first;
++	int table, node, chosen;
++
++	asv_fdt = fdt;
++
++	for (i = 0; i < 4; i++)
++		if (smc_read(ASV_FUSES + 4 * i, &w[i])) {
++			asv_log("asv-smc", i);
++			return -EINVAL;
++		}
++	chosen = fdt_path_offset(fdt, "/chosen");
++	if (chosen >= 0) {
++		u32 cells[4];
++
++		for (i = 0; i < 4; i++)
++			put_be32(&cells[i], w[i]);
++		fdt_setprop(fdt, chosen, "gtaxl,asv-fuses", cells, sizeof(cells));
++	}
++
++	/* unfused parts: table 0, group 0, no SSA, as asv_get_asvinfo() */
++	ver = (w[3] >> 7) & 1 ? w[3] & 0x7f : 0;
++	if (memcmp(ect, "PARA", 4)) {
++		asv_log("asv-ect", 0);
++		return -EINVAL;
++	}
++	asv = find(12, 0, "ASV");
++	gen = find(12, 0, "GEN");
++	if (!asv || !gen || u32_at(asv, &pv) || pv < 3) {
++		asv_log("asv-ect", 1);
++		return -EINVAL;
++	}
++
++	for (i = 0; i < NRAIL; i++) {
++		if (load_domain(asv, gen, rail[i].ect, rail[i].ssa, ver, &a) ||
++		    max_voltage(&a, fuse_field(w, rail[i].fuse), &uv)) {
++			asv_log("asv-rail", i);
++			return -EINVAL;
++		}
++		if (uv > floor)
++			floor = uv;
++	}
++	floor += VOLT_MARGIN;
++	if (floor < VOLT_MIN || floor > VOLT_MAX) {
++		asv_log("asv-rail-uv", floor);
++		return -EINVAL;
++	}
++
++	for (d = 0; d < NDOM; d++) {
++		first = n;
++		field = fuse_field(w, domains[d].fuse);
++		table = fdt_path_offset(fdt, domains[d].path);
++		if (table < 0 || load_domain(asv, gen, domains[d].ect, domains[d].ssa, ver, &a)) {
++			asv_log("asv-dom", d);
++			return -EINVAL;
++		}
++		fdt_for_each_subnode(node, fdt, table) {
++			const void *hz = fdt_getprop(fdt, node, "opp-hz", NULL);
++			const u32 *mv;
++			int len;
++			u32 uv, mhz;
++
++			mv = fdt_getprop(fdt, node, "opp-microvolt", &len);
++			if (!hz || !mv)
++				continue;
++			mhz = (u32)((((u64)be32(hz) << 32 | be32((const char *)hz + 4)) + 500000) / 1000000);
++			if (n == NDOM * MAX_OPPS || voltage(&a, field, mhz, &uv) ||
++			    (len != 4 && len != 12)) {
++				asv_log("asv-opp", mhz);
++				return -EINVAL;
++			}
++			uv += VOLT_MARGIN;
++			if (d == DOM_G3D && uv < floor)
++				uv = floor;
++			if (uv < VOLT_MIN || uv > VOLT_MAX ||
++			    (len == 12 && uv > be32(&mv[2]))) {
++				asv_log("asv-uv", uv);
++				return -EINVAL;
++			}
++			opp[n].node = node;
++			opp[n].cells = len / 4;
++			opp[n].uv = uv;
++			n++;
++		}
++		if (n == first) {
++			asv_log("asv-empty", d);
++			return -EINVAL;
++		}
++	}
++
++	/* every OPP has its voltage: write them, in place */
++	for (i = 0; i < n; i++) {
++		u32 cells[3];
++		const u32 *mv = fdt_getprop(fdt, opp[i].node, "opp-microvolt", NULL);
++
++		memcpy(cells, mv, opp[i].cells * 4);
++		put_be32(&cells[0], opp[i].uv);
++		if (opp[i].cells == 3)
++			put_be32(&cells[1], opp[i].uv);
++		if (fdt_setprop_inplace(fdt, opp[i].node, "opp-microvolt", cells, opp[i].cells * 4))
++			return -EINVAL;
++	}
++	if (chosen >= 0) {
++		u32 cell;
++
++		put_be32(&cell, floor);
++		if (fdt_setprop(fdt, chosen, "gtaxl,buck2-floor", &cell, sizeof(cell)))
++			return -ENOSPC;
++	}
++	return 0;
++}
++
++/* If calibration is unavailable, preserve the bootloader rails and report it. */
++int p580_asv_fixup(void *fdt)
++{
++	char path[32];
++	int ret, node, chosen, i;
++
++	if (fdt_node_check_compatible(fdt, 0, "samsung,gtanotexlwifi"))
++		return 0;
++
++	ret = apply_asv(fdt);
++	if (ret) {
++		printf("P580 ASV failed (%d): leaving CPU/GPU rails unchanged\n", ret);
++		for (i = 0; i < 8; i++) {
++			snprintf(path, sizeof(path), "/cpus/cpu@%x", i < 4 ? i : i + 0xfc);
++			node = fdt_path_offset(fdt, path);
++			if (node >= 0) {
++				fdt_delprop(fdt, node, "operating-points-v2");
++				fdt_delprop(fdt, node, "cpu-supply");
++			}
++		}
++		node = fdt_path_offset(fdt, "/soc@0/gpu@11400000");
++		if (node < 0 || fdt_setprop_string(fdt, node, "status", "disabled"))
++			return -EINVAL;
++	}
++	chosen = fdt_path_offset(fdt, "/chosen");
++	if (chosen < 0)
++		return -EINVAL;
++	return fdt_setprop_string(fdt, chosen, "samsung,p580-asv-status",
++				  ret ? "failed-dvfs-disabled" : "okay");
++}
+diff --git a/board/samsung/exynos-mobile/p580-asv.h b/board/samsung/exynos-mobile/p580-asv.h
+new file mode 100644
+--- /dev/null
++++ b/board/samsung/exynos-mobile/p580-asv.h
+@@ -0,0 +1,5 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef P580_ASV_H
++#define P580_ASV_H
++int p580_asv_fixup(void *fdt);
++#endif
+diff --git a/dts/upstream/src/arm64/exynos/exynos7870-gtanotexlwifi.dts b/dts/upstream/src/arm64/exynos/exynos7870-gtanotexlwifi.dts
+new file mode 100644
+--- /dev/null
++++ b/dts/upstream/src/arm64/exynos/exynos7870-gtanotexlwifi.dts
+@@ -0,0 +1,639 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Samsung Galaxy Tab A 10.1 (2016) with S Pen (SM-P580)
++ *
++ * Hardware information ported from the Samsung downstream tree
++ * (exynos7870-gtanotexl_common.dtsi).
++ */
++
++/dts-v1/;
++#include "exynos7870.dtsi"
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/input/input.h>
++#include <dt-bindings/interrupt-controller/irq.h>
++
++/ {
++	model = "Samsung Galaxy Tab A 10.1 (2016) with S Pen";
++	compatible = "samsung,gtanotexlwifi", "samsung,exynos7870";
++	chassis-type = "tablet";
++
++	aliases {
++		mmc0 = &mmc0;
++		mmc1 = &mmc1;
++		mmc2 = &mmc2;
++		serial0 = &serial0;
++		serial1 = &serial1;
++		serial2 = &serial2;
++	};
++
++	chosen {
++		#address-cells = <2>;
++		#size-cells = <1>;
++		ranges;
++
++		stdout-path = &serial2;
++
++
++	};
++
++	gpio-keys {
++		compatible = "gpio-keys";
++		label = "GPIO Keys";
++
++		pinctrl-names = "default";
++		pinctrl-0 = <&key_home &key_power &key_voldown &key_volup &hall_irq>;
++
++		key-home {
++			label = "Home Key";
++			gpios = <&gpa1 7 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_HOMEPAGE>;
++		};
++
++		key-power {
++			label = "Power Key";
++			gpios = <&gpa0 0 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_POWER>;
++		};
++
++		key-voldown {
++			label = "Volume Down Key";
++			gpios = <&gpa2 1 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_VOLUMEDOWN>;
++		};
++
++		key-volup {
++			label = "Volume Up Key";
++			gpios = <&gpa2 0 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_VOLUMEUP>;
++		};
++
++		switch-hall {
++			label = "Hall Sensor (flip cover)";
++			gpios = <&gpa1 3 GPIO_ACTIVE_LOW>;
++			linux,input-type = <EV_SW>;
++			linux,code = <SW_LID>;
++			linux,can-disable;
++		};
++	};
++
++	/* 32.768 kHz sleep clock supplied to the QCA6174 by the PMIC */
++	bt_sleep_clk: clock-bt-sleep {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <32768>;
++		clock-output-names = "bt_sleep_clk";
++	};
++
++	memory@40000000 {
++		device_type = "memory";
++		reg = <0x0 0x40000000 0x3e400000>,
++		      <0x0 0x80000000 0x80000000>;
++	};
++
++	/* WLAN_EN (gpd3-6) on the QCA6174 SDIO module */
++	pwrseq_mmc1: pwrseq-mmc1 {
++		compatible = "mmc-pwrseq-simple";
++		reset-gpios = <&gpd3 6 GPIO_ACTIVE_LOW>;
++		post-power-on-delay-ms = <50>;
++	};
++
++	reserved-memory {
++		#address-cells = <2>;
++		#size-cells = <1>;
++		ranges;
++
++		ramoops@46e00000 {
++			compatible = "ramoops";
++			reg = <0x0 0x46e00000 0x8000>;
++			console-size = <0x4000>;
++			pmsg-size = <0x4000>;
++		};
++
++		cont_splash_mem: framebuffer@67000000 {
++			reg = <0x0 0x67000000 0x008ca000>;
++			no-map;
++		};
++	};
++
++	/* DCDC_EN: shared supply for the QCA6174 Wi-Fi/BT combo module */
++	vdd_cnss_dcdc: regulator-cnss-dcdc {
++		compatible = "regulator-fixed";
++		regulator-name = "cnss_dcdc_en";
++		startup-delay-us = <4000>;
++		gpio = <&gpa0 6 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		regulator-always-on;
++	};
++
++	vdd_fixed_mmc2: regulator-fixed-mmc2 {
++		compatible = "regulator-fixed";
++		regulator-name = "vdd_fixed_mmc2";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		gpio = <&gpc0 0 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++	};
++
++	vdd_tsp_avdd: regulator-tsp-avdd {
++		compatible = "regulator-fixed";
++		regulator-name = "tsp_avdd";
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		gpio = <&gpd1 6 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++	};
++
++	vdd_tsp_dvdd: regulator-tsp-dvdd {
++		compatible = "regulator-fixed";
++		regulator-name = "tsp_dvdd";
++		regulator-min-microvolt = <1800000>;
++		regulator-max-microvolt = <1800000>;
++		gpio = <&gpd1 4 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++	};
++
++
++};
++
++&gpu {
++	status = "okay";
++};
++
++&hsi2c0 {
++	#address-cells = <1>;
++	#size-cells = <0>;
++
++	status = "okay";
++
++	pmic@66 {
++		compatible = "samsung,s2mpu05-pmic";
++		reg = <0x66>;
++		interrupt-parent = <&gpa0>;
++		interrupts = <2 IRQ_TYPE_LEVEL_LOW>;
++
++		pinctrl-names = "default";
++		pinctrl-0 = <&pmic_irq>;
++
++		regulators {
++			vdd_buck1: buck1 {
++				regulator-name = "vdd_buck1";
++				regulator-min-microvolt = <500000>;
++				regulator-max-microvolt = <1300000>;
++				regulator-always-on;
++				regulator-boot-on;
++			};
++
++			vdd_buck2: buck2 {
++				regulator-name = "vdd_buck2";
++				regulator-min-microvolt = <500000>;
++				regulator-max-microvolt = <1300000>;
++				regulator-always-on;
++				regulator-boot-on;
++			};
++
++			vdd_buck3: buck3 {
++				regulator-name = "vdd_buck3";
++				regulator-min-microvolt = <500000>;
++				regulator-max-microvolt = <1300000>;
++				regulator-always-on;
++				regulator-boot-on;
++			};
++
++			vdd_buck4: buck4 {
++				regulator-name = "vdd_buck4";
++				regulator-min-microvolt = <1200000>;
++				regulator-max-microvolt = <1500000>;
++				regulator-always-on;
++				regulator-boot-on;
++			};
++
++			vdd_buck5: buck5 {
++				regulator-name = "vdd_buck5";
++				regulator-min-microvolt = <1800000>;
++				regulator-max-microvolt = <2100000>;
++				regulator-always-on;
++				regulator-boot-on;
++			};
++
++			vdd_ldo1: ldo1 {
++				regulator-name = "vdd_ldo1";
++				regulator-min-microvolt = <650000>;
++				regulator-max-microvolt = <1350000>;
++				regulator-always-on;
++				regulator-boot-on;
++			};
++
++			/* SD card I/O */
++			vdd_ldo2: ldo2 {
++				regulator-name = "vqmmc";
++				regulator-min-microvolt = <1800000>;
++				regulator-max-microvolt = <2800000>;
++			};
++
++			vdd_ldo3: ldo3 {
++				regulator-name = "vdd_ldo3";
++				regulator-min-microvolt = <800000>;
++				regulator-max-microvolt = <2375000>;
++				regulator-always-on;
++				regulator-boot-on;
++			};
++
++			vdd_ldo4: ldo4 {
++				regulator-name = "vdd_ldo4";
++				regulator-min-microvolt = <800000>;
++				regulator-max-microvolt = <1350000>;
++				regulator-always-on;
++				regulator-boot-on;
++			};
++
++			vdd_ldo5: ldo5 {
++				regulator-name = "vdd_ldo5";
++				regulator-min-microvolt = <800000>;
++				regulator-max-microvolt = <1350000>;
++				regulator-always-on;
++				regulator-boot-on;
++			};
++
++			vdd_ldo6: ldo6 {
++				regulator-name = "vdd_ldo6";
++				regulator-min-microvolt = <800000>;
++				regulator-max-microvolt = <1350000>;
++				regulator-always-on;
++				regulator-boot-on;
++			};
++
++			vdd_ldo7: ldo7 {
++				regulator-name = "vdd_ldo7";
++				regulator-min-microvolt = <800000>;
++				regulator-max-microvolt = <2375000>;
++				regulator-always-on;
++				regulator-boot-on;
++			};
++
++			vdd_ldo8: ldo8 {
++				regulator-name = "vdd_ldo8";
++				regulator-min-microvolt = <1800000>;
++				regulator-max-microvolt = <3375000>;
++				regulator-always-on;
++				regulator-boot-on;
++			};
++
++			vdd_ldo9: ldo9 {
++				regulator-name = "vdd_ldo9";
++				regulator-min-microvolt = <650000>;
++				regulator-max-microvolt = <1350000>;
++				regulator-always-on;
++			};
++
++			vdd_ldo10: ldo10 {
++				regulator-name = "vdd_ldo10";
++				regulator-min-microvolt = <650000>;
++				regulator-max-microvolt = <1350000>;
++				regulator-always-on;
++			};
++
++			vdd_ldo25: ldo25 {
++				regulator-name = "vdd_codec_1p8";
++				regulator-min-microvolt = <1800000>;
++				regulator-max-microvolt = <1800000>;
++				regulator-always-on;
++			};
++
++			vdd_ldo26: ldo26 {
++				regulator-name = "vemmc";
++				regulator-min-microvolt = <1800000>;
++				regulator-max-microvolt = <3375000>;
++				regulator-boot-on;
++			};
++
++			vdd_ldo27: ldo27 {
++				regulator-name = "vqemmc";
++				regulator-min-microvolt = <800000>;
++				regulator-max-microvolt = <2375000>;
++				regulator-boot-on;
++			};
++
++			vdd_ldo29: ldo29 {
++				regulator-name = "vdd_cam_af_2p8";
++				regulator-min-microvolt = <2800000>;
++				regulator-max-microvolt = <2800000>;
++			};
++
++			vdd_ldo30: ldo30 {
++				regulator-name = "vdd_cam_core_1p2";
++				regulator-min-microvolt = <1200000>;
++				regulator-max-microvolt = <1200000>;
++			};
++
++			vdd_ldo31: ldo31 {
++				regulator-name = "vdd_ldo31";
++				regulator-min-microvolt = <2800000>;
++				regulator-max-microvolt = <2800000>;
++				regulator-always-on;
++				regulator-boot-on;
++			};
++
++			vdd_ldo32: ldo32 {
++				regulator-name = "vdd_codec_3p3";
++				regulator-min-microvolt = <3300000>;
++				regulator-max-microvolt = <3300000>;
++				regulator-always-on;
++			};
++
++			vdd_ldo33: ldo33 {
++				regulator-name = "vdd_ldo33";
++				regulator-min-microvolt = <2800000>;
++				regulator-max-microvolt = <2800000>;
++			};
++
++			vdd_ldo34: ldo34 {
++				regulator-name = "vddio_1p8_cam";
++				regulator-min-microvolt = <1800000>;
++				regulator-max-microvolt = <1800000>;
++			};
++
++			/* LCD_1P8 */
++			vdd_ldo35: ldo35 {
++				regulator-name = "vdd_lcd_1p8";
++				regulator-min-microvolt = <1800000>;
++				regulator-max-microvolt = <1800000>;
++				regulator-boot-on;
++				regulator-always-on;
++			};
++		};
++	};
++};
++
++&i2c1 {
++	#address-cells = <1>;
++	#size-cells = <0>;
++	samsung,i2c-sda-delay = <100>;
++	samsung,i2c-max-bus-freq = <400000>;
++
++	status = "okay";
++
++	touchscreen@49 {
++		compatible = "st,stmfts7";
++		reg = <0x49>;
++
++		interrupt-parent = <&gpa0>;
++		interrupts = <4 IRQ_TYPE_LEVEL_LOW>;
++
++		pinctrl-names = "default";
++		pinctrl-0 = <&touch_irq>;
++
++		avdd-supply = <&vdd_tsp_avdd>;
++		vdd-supply = <&vdd_tsp_dvdd>;
++
++		touchscreen-size-x = <1199>;
++		touchscreen-size-y = <1919>;
++		touch-key-connected;
++	};
++};
++
++&i2c0 {
++	#address-cells = <1>;
++	#size-cells = <0>;
++	samsung,i2c-sda-delay = <100>;
++	samsung,i2c-max-bus-freq = <400000>;
++
++	status = "okay";
++
++	/* Silicon Mitus SM5703 fuel gauge (the charger/MFC part is at i2c4 0x49) */
++	fuel-gauge@71 {
++		compatible = "siliconmitus,sm5703-fg";
++		reg = <0x71>;
++		power-supplies = <&charger>;
++	};
++};
++
++&i2c4 {
++	#address-cells = <1>;
++	#size-cells = <0>;
++	samsung,i2c-sda-delay = <100>;
++	samsung,i2c-max-bus-freq = <400000>;
++
++	status = "okay";
++
++	/* Silicon Mitus SM5703 charger/MFD (nCHGEN gpd1-3, IRQ gpa2-7) */
++	charger: charger@49 {
++		compatible = "siliconmitus,sm5703-charger";
++		reg = <0x49>;
++	};
++};
++
++&i2c7 {
++	#address-cells = <1>;
++	#size-cells = <0>;
++	samsung,i2c-sda-delay = <100>;
++	samsung,i2c-max-bus-freq = <400000>;
++
++	status = "okay";
++
++	/* ST K2HH (LSM303C-family) accelerometer */
++	accelerometer@1d {
++		compatible = "st,lsm303c-accel";
++		reg = <0x1d>;
++
++		interrupt-parent = <&gpa0>;
++		interrupts = <7 IRQ_TYPE_EDGE_RISING>;
++
++		pinctrl-names = "default";
++		pinctrl-0 = <&accel_irq>;
++
++		vdd-supply = <&vdd_ldo3>;
++		vddio-supply = <&vdd_ldo3>;
++
++		/* Mounted on the back of the board, rotated 180 degrees */
++		mount-matrix = "-1", "0", "0",
++			       "0", "-1", "0",
++			       "0", "0", "-1";
++	};
++};
++
++&mmc0 {
++	pinctrl-names = "default";
++	pinctrl-0 = <&sd0_clk &sd0_cmd &sd0_rdqs &sd0_bus1 &sd0_bus4 &sd0_bus8>;
++
++	vmmc-supply = <&vdd_ldo26>;
++	vqmmc-supply = <&vdd_ldo27>;
++
++	fifo-depth = <64>;
++	samsung,dw-mshc-ciu-div = <3>;
++	samsung,dw-mshc-sdr-timing = <0 4>;
++	samsung,dw-mshc-ddr-timing = <2 4>;
++	non-removable;
++
++	status = "okay";
++};
++
++&mmc1 {
++	#address-cells = <1>;
++	#size-cells = <0>;
++
++	pinctrl-names = "default";
++	pinctrl-0 = <&sd1_clk &sd1_cmd &sd1_bus1 &sd1_bus4>;
++
++	mmc-pwrseq = <&pwrseq_mmc1>;
++	vmmc-supply = <&vdd_cnss_dcdc>;
++
++	bus-width = <4>;
++	fifo-depth = <64>;
++	samsung,dw-mshc-ciu-div = <3>;
++	samsung,dw-mshc-sdr-timing = <0 3>;
++	samsung,dw-mshc-ddr-timing = <1 2>;
++	non-removable;
++	cap-sd-highspeed;
++	cap-sdio-irq;
++	keep-power-in-suspend;
++
++	status = "okay";
++
++	/*
++	 * Qualcomm QCA6174 SDIO Wi-Fi (ath10k_sdio). WLAN_HOST_WAKE is on
++	 * gpa2-2 but ath10k_sdio uses the SDIO IRQ, so it is not described.
++	 */
++	wifi@1 {
++		compatible = "qcom,ath10k";
++		reg = <0x1>;
++	};
++};
++
++&mmc2 {
++	pinctrl-names = "default";
++	pinctrl-0 = <&sd2_clk &sd2_cmd &sd2_bus1 &sd2_bus4 &dwmmc2_irq>;
++
++	vmmc-supply = <&vdd_fixed_mmc2>;
++	vqmmc-supply = <&vdd_ldo2>;
++
++	bus-width = <4>;
++	card-detect-delay = <200>;
++	fifo-depth = <64>;
++	samsung,dw-mshc-ciu-div = <3>;
++	samsung,dw-mshc-sdr-timing = <0 3>;
++	samsung,dw-mshc-ddr-timing = <1 2>;
++	sd-uhs-sdr50;
++	sd-uhs-sdr104;
++	broken-cd;
++	disable-wp;
++
++	status = "okay";
++};
++
++&oscclk {
++	clock-frequency = <26000000>;
++};
++
++&pinctrl_alive {
++	accel_irq: accel-irq-pins {
++		samsung,pins = "gpa0-7";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++		samsung,pin-drv = <EXYNOS5433_PIN_DRV_FAST_SR1>;
++	};
++
++	bt_host_wake: bt-host-wake-pins {
++		samsung,pins = "gpa1-6";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++		samsung,pin-drv = <EXYNOS5433_PIN_DRV_FAST_SR1>;
++	};
++
++	dwmmc2_irq: dwmmc2-irq-pins {
++		samsung,pins = "gpa0-1";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++		samsung,pin-drv = <EXYNOS5433_PIN_DRV_FAST_SR1>;
++	};
++
++	hall_irq: hall-irq-pins {
++		samsung,pins = "gpa1-3";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++		samsung,pin-drv = <EXYNOS5433_PIN_DRV_FAST_SR1>;
++	};
++
++	key_home: key-home-pins {
++		samsung,pins = "gpa1-7";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++		samsung,pin-drv = <EXYNOS5433_PIN_DRV_FAST_SR1>;
++	};
++
++	key_power: key-power-pins {
++		samsung,pins = "gpa0-0";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++		samsung,pin-drv = <EXYNOS5433_PIN_DRV_FAST_SR1>;
++	};
++
++	key_voldown: key-voldown-pins {
++		samsung,pins = "gpa2-1";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++		samsung,pin-drv = <EXYNOS5433_PIN_DRV_FAST_SR1>;
++	};
++
++	key_volup: key-volup-pins {
++		samsung,pins = "gpa2-0";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++		samsung,pin-drv = <EXYNOS5433_PIN_DRV_FAST_SR1>;
++	};
++
++	pmic_irq: pmic-irq-pins {
++		samsung,pins = "gpa0-2";
++		samsung,pin-pud = <EXYNOS_PIN_PULL_UP>;
++		samsung,pin-drv = <EXYNOS5433_PIN_DRV_FAST_SR3>;
++	};
++
++	/* TSP_INT: STM FTS touchscreen interrupt */
++	touch_irq: touch-irq-pins {
++		samsung,pins = "gpa0-4";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++		samsung,pin-drv = <EXYNOS5433_PIN_DRV_FAST_SR1>;
++	};
++
++	wlan_host_wake: wlan-host-wake-pins {
++		samsung,pins = "gpa2-2";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_DOWN>;
++		samsung,pin-drv = <EXYNOS5433_PIN_DRV_FAST_SR1>;
++	};
++};
++
++/* UART1 (serial0): QCA6174 Bluetooth (HCI over UART with flow control) */
++&serial0 {
++	status = "okay";
++
++	bluetooth {
++		compatible = "qcom,qca6174-bt";
++
++		enable-gpios = <&gpd4 0 GPIO_ACTIVE_HIGH>;
++		clocks = <&bt_sleep_clk>;
++
++		pinctrl-names = "default";
++		pinctrl-0 = <&bt_host_wake>;
++	};
++};
++
++&serial2 {
++	status = "okay";
++};
++
++&usbdrd {
++	vdd33-supply = <&vdd_ldo8>;
++
++	status = "okay";
++};
++
++/ {
++	reserved-memory {
++		cp_boot@effff000 { reg = <0x0 0xeffff000 0x1000>; no-map; };
++		cp@f0000000 { reg = <0x0 0xf0000000 0x7800000>; no-map; };
++		gnss@f7c00000 { reg = <0x0 0xf7c00000 0x400000>; no-map; };
++		mfc_fw@ae600000 { reg = <0x0 0xae600000 0x400000>; no-map; };
++		ect@90000000 { reg = <0x0 0x90000000 0x14000>; no-map; };
++	};
++};
+diff --git a/configs/p580_defconfig b/configs/p580_defconfig
+new file mode 100644
+--- /dev/null
++++ b/configs/p580_defconfig
+@@ -0,0 +1,76 @@
++CONFIG_ARM=y
++CONFIG_SKIP_LOWLEVEL_INIT=y
++CONFIG_COUNTER_FREQUENCY=26000000
++CONFIG_POSITION_INDEPENDENT=y
++CONFIG_ARCH_EXYNOS=y
++CONFIG_SYS_MALLOC_LEN=0x2000000
++CONFIG_SYS_MALLOC_F_LEN=0x16000
++CONFIG_TARGET_EXYNOS_MOBILE=y
++CONFIG_NR_DRAM_BANKS=3
++CONFIG_DEFAULT_DEVICE_TREE="exynos/exynos7870-gtanotexlwifi"
++CONFIG_SYS_BOOTM_LEN=0x2000000
++CONFIG_SYS_LOAD_ADDR=0x80000000
++CONFIG_ARMV8_CNTFRQ_BROKEN=y
++# CONFIG_PSCI_RESET is not set
++CONFIG_EFI_RUNTIME_UPDATE_CAPSULE=y
++CONFIG_EFI_CAPSULE_ON_DISK=y
++CONFIG_EFI_CAPSULE_ON_DISK_EARLY=y
++CONFIG_EFI_CAPSULE_FIRMWARE_RAW=y
++CONFIG_BUTTON_CMD=y
++CONFIG_USE_PREBOOT=y
++CONFIG_SAVE_PREV_BL_FDT_ADDR=y
++CONFIG_SAVE_PREV_BL_INITRAMFS_START_ADDR=y
++CONFIG_SYS_PBSIZE=1024
++CONFIG_BOARD_TYPES=y
++# CONFIG_DISPLAY_CPUINFO is not set
++CONFIG_MISC_INIT_R=y
++CONFIG_HUSH_PARSER=y
++CONFIG_CMD_BOOTMENU=y
++CONFIG_CMD_POWEROFF=y
++CONFIG_CMD_FS_GENERIC=y
++CONFIG_EFI_PARTITION=y
++CONFIG_OF_UPSTREAM=y
++CONFIG_OF_UPSTREAM_BUILD_VENDOR=y
++CONFIG_OF_BOARD=y
++CONFIG_BLKMAP=y
++CONFIG_BUTTON=y
++CONFIG_BUTTON_REMAP_PHONE_KEYS=y
++CONFIG_CLK_EXYNOS7870=y
++CONFIG_DFU_MMC=y
++CONFIG_SYS_DFU_DATA_BUF_SIZE=0x200000
++CONFIG_USB_FUNCTION_FASTBOOT=y
++CONFIG_FASTBOOT_BUF_ADDR=0xdead0000
++CONFIG_FASTBOOT_FLASH=y
++CONFIG_FASTBOOT_FLASH_MMC_DEV=0
++CONFIG_SYS_I2C_S3C24X0=y
++CONFIG_MISC=y
++CONFIG_MMC_BROKEN_CD=y
++CONFIG_MMC_IO_VOLTAGE=y
++CONFIG_MMC_UHS_SUPPORT=y
++CONFIG_MMC_HS400_SUPPORT=y
++CONFIG_MMC_DW=y
++CONFIG_PHY=y
++CONFIG_PHY_EXYNOS_USBDRD=y
++CONFIG_PINCTRL=y
++CONFIG_PINCTRL_EXYNOS78x0=y
++CONFIG_DM_PMIC=y
++CONFIG_PMIC_S2MPS11=y
++CONFIG_DM_REGULATOR=y
++CONFIG_DM_REGULATOR_FIXED=y
++CONFIG_DM_REGULATOR_S2MPS11=y
++CONFIG_SOC_SAMSUNG=y
++CONFIG_EXYNOS_PMU=y
++CONFIG_SYSRESET=y
++CONFIG_SYSRESET_CMD_POWEROFF=y
++CONFIG_SYSRESET_SYSCON=y
++CONFIG_USB=y
++CONFIG_DM_USB_GADGET=y
++CONFIG_USB_DWC3=y
++CONFIG_USB_DWC3_GENERIC=y
++CONFIG_USB_GADGET=y
++CONFIG_USB_GADGET_MANUFACTURER="Samsung"
++CONFIG_USB_GADGET_VENDOR_NUM=0x04e8
++CONFIG_USB_GADGET_PRODUCT_NUM=0x6602
++# CONFIG_VIDEO is not set
++CONFIG_FS_EXT4=y
++CONFIG_FS_FAT=y

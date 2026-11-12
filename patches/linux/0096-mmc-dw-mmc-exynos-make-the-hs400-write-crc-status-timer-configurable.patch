@@ -1,0 +1,90 @@
+From a04f0795347c748ce5bfa5cb9de704783f65f46b Mon Sep 17 00:00:00 2001
+From: Alessandro Fontana <alessandro.fontana@pm.me>
+Date: Mon, 28 Sep 2026 18:41:29 +0200
+Subject: [PATCH] mmc: dw_mmc-exynos: make the HS400 write CRC status timer
+ configurable
+
+The write CRC status timer in the RCLK_EN register is left by the
+bootloader as it set it for the speeds it runs at (0x13/0x15 on the
+Exynos7870 of the Galaxy Tab A 10.1 (2016)), while the vendor kernel
+programs it for DDR200 (fastlimit 0x34, initval 0x38) together with
+the other HS400 settings.
+
+Add two optional properties, samsung,dw-mshc-txdt-crc-timer-fastlimit
+and samsung,dw-mshc-txdt-crc-timer-initval, and program them when the
+controller switches to HS400. Without them the register keeps what the
+bootloader set, as before.
+
+With these and the other vendor HS400 settings in its device tree
+(HS400 after HS200 tuning: Enhanced Strobe, which the vendor uses, is
+not supported by dw_mmc), that board reads sequentially at
+176-228 MB/s, against 58-158 MB/s in HS200; two full reads of the
+3.1 GB super partition hash identically, 1 GiB written to /data reads
+back identical, and five boots in a row come up in HS400 with no bus
+errors.
+
+Assisted-by: LLM
+Signed-off-by: Alessandro Fontana <alessandro.fontana@pm.me>
+---
+ drivers/mmc/host/dw_mmc-exynos.c | 18 ++++++++++++++++++
+ drivers/mmc/host/dw_mmc-exynos.h |  4 ++++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/drivers/mmc/host/dw_mmc-exynos.c b/drivers/mmc/host/dw_mmc-exynos.c
+index 4b76b997dd..61e6b6c13a 100644
+--- a/drivers/mmc/host/dw_mmc-exynos.c
++++ b/drivers/mmc/host/dw_mmc-exynos.c
+@@ -44,6 +44,9 @@ struct dw_mci_exynos_priv_data {
+ 	u32				dqs_delay;
+ 	u32				saved_dqs_en;
+ 	u32				saved_strobe_ctrl;
++	/* write CRC status timer for HS400, 0 = keep what the bootloader set */
++	u32				txdt_crc_fastlimit;
++	u32				txdt_crc_initval;
+ };
+ 
+ static struct dw_mci_exynos_compatible {
+@@ -287,6 +290,16 @@ static void dw_mci_exynos_config_hs400(struct dw_mci *host, u32 timing)
+ 	if (timing == MMC_TIMING_MMC_HS400) {
+ 		dqs |= DATA_STROBE_EN;
+ 		strobe = DQS_CTRL_RD_DELAY(strobe, priv->dqs_delay);
++		/*
++		 * The bootloader leaves the write CRC status timer tuned for
++		 * the speeds it runs at; the vendor kernel sets it for DDR200
++		 * together with the other HS400 settings.
++		 */
++		if (priv->txdt_crc_fastlimit || priv->txdt_crc_initval) {
++			dqs &= ~TXDT_CRC_TIMER_SET(0xff, 0xff);
++			dqs |= TXDT_CRC_TIMER_SET(priv->txdt_crc_fastlimit,
++						  priv->txdt_crc_initval);
++		}
+ 	} else if (timing == MMC_TIMING_UHS_SDR104) {
+ 		dqs &= 0xffffff00;
+ 	} else {
+@@ -421,6 +434,11 @@ static int dw_mci_exynos_parse_dt(struct dw_mci *host)
+ 
+ 	priv->hs400_timing = SDMMC_CLKSEL_TIMING(timing[0], timing[1],
+ 						HS400_FIXED_CIU_CLK_DIV);
++
++	of_property_read_u32(np, "samsung,dw-mshc-txdt-crc-timer-fastlimit",
++			     &priv->txdt_crc_fastlimit);
++	of_property_read_u32(np, "samsung,dw-mshc-txdt-crc-timer-initval",
++			     &priv->txdt_crc_initval);
+ 	host->priv = priv;
+ 	return 0;
+ }
+diff --git a/drivers/mmc/host/dw_mmc-exynos.h b/drivers/mmc/host/dw_mmc-exynos.h
+index 0280d394a3..1673942938 100644
+--- a/drivers/mmc/host/dw_mmc-exynos.h
++++ b/drivers/mmc/host/dw_mmc-exynos.h
+@@ -33,6 +33,10 @@
+ /* RCLK_EN register defines */
+ #define DATA_STROBE_EN			BIT(0)
+ #define AXI_NON_BLOCKING_WR	BIT(7)
++#define TXDT_CRC_TIMER_FASTLIMIT(x)	(((x) & 0xFF) << 16)
++#define TXDT_CRC_TIMER_INITVAL(x)	(((x) & 0xFF) << 8)
++#define TXDT_CRC_TIMER_SET(x, y)	(TXDT_CRC_TIMER_FASTLIMIT(x) | \
++					 TXDT_CRC_TIMER_INITVAL(y))
+ 
+ /* DLINE_CTRL register defines */
+ #define DQS_CTRL_RD_DELAY(x, y)		(((x) & ~0x3FF) | ((y) & 0x3FF))

@@ -1,0 +1,88 @@
+From 59ee192798c7dbf360d56bc44b87b5438cb81b38 Mon Sep 17 00:00:00 2001
+From: Alessandro Fontana <alessandro.fontana@pm.me>
+Date: Sun, 6 Sep 2026 16:00:00 +0200
+Subject: [PATCH] drm/exynos: decon7: program BLENDCON and WINCHMAP0 in
+ decon_init()
+
+decon_init() leaves two global registers to whatever the bootloader
+wrote, which only holds on a warm handoff. Program them after the
+reset, as the vendor driver does in decon_reg_init():
+
+- BLENDCON: select 8-bit alpha values. The blending code only sets the
+  mode when a non-opaque plane alpha is requested, which SurfaceFlinger
+  never does, so on Android the block would otherwise stay in the
+  legacy 4-bit alpha mode while every window carries an 8-bit
+  per-pixel alpha.
+
+- WINCHMAP0: map window N to DMA channel N. The Exynos7870 DECON has
+  three DMA channels and three windows; the vendor driver
+  (decon_reg_config_win_channel()) uses this identity mapping, naming
+  channels 0/1/2 IDMA_G2/G0/G1, and the bootloader leaves 0x210.
+
+No functional change on a warm boot for WINCHMAP0: the value written is
+the one found.
+
+Assisted-by: LLM
+Signed-off-by: Alessandro Fontana <alessandro.fontana@pm.me>
+---
+ drivers/gpu/drm/exynos/exynos7_drm_decon.c | 23 ++++++++++++++++++++++
+ drivers/gpu/drm/exynos/regs-decon7.h       |  5 +++++
+ 2 files changed, 28 insertions(+)
+
+diff --git a/drivers/gpu/drm/exynos/exynos7_drm_decon.c b/drivers/gpu/drm/exynos/exynos7_drm_decon.c
+index f9b9db180b..bd4c039d24 100644
+--- a/drivers/gpu/drm/exynos/exynos7_drm_decon.c
++++ b/drivers/gpu/drm/exynos/exynos7_drm_decon.c
+@@ -671,6 +671,7 @@ static void decon_stop(struct decon_context *ctx)
+ static void decon_init(struct decon_context *ctx)
+ {
+ 	u32 val;
++	unsigned int win;
+ 
+ 	decon_stop(ctx);
+ 
+@@ -683,6 +684,28 @@ static void decon_init(struct decon_context *ctx)
+ 
+ 	if (!ctx->i80_if)
+ 		writel(VIDCON1_VCLK_HOLD, ctx->regs + VIDCON1(0));
++
++	/*
++	 * Use 8-bit alpha values throughout, as the vendor driver does right
++	 * after the reset: in the legacy 4-bit mode the per-pixel alpha of
++	 * an ARGB8888 window is not interpreted as 8-bit coverage.
++	 */
++	val = readl(ctx->regs + BLENDCON);
++	val &= ~BLENDCON_NEW_MASK;
++	val |= BLENDCON_NEW_8BIT_ALPHA_VALUE;
++	writel(val, ctx->regs + BLENDCON);
++
++	/*
++	 * Map every window to its own DMA channel. The Exynos7870 DECON has
++	 * three channels (0..2) and the vendor driver programs window N to
++	 * channel N (IDMA_G2/G0/G1 in its naming).
++	 */
++	val = readl(ctx->regs + WINCHMAP0);
++	for (win = 0; win < WINDOWS_NR; win++) {
++		val &= ~WINCHMAP_MASK(win);
++		val |= WINCHMAP_DMA(win, win);
++	}
++	writel(val, ctx->regs + WINCHMAP0);
+ }
+ 
+ static void decon_atomic_enable(struct exynos_drm_crtc *crtc)
+diff --git a/drivers/gpu/drm/exynos/regs-decon7.h b/drivers/gpu/drm/exynos/regs-decon7.h
+index 216c106dac..974c056c08 100644
+--- a/drivers/gpu/drm/exynos/regs-decon7.h
++++ b/drivers/gpu/drm/exynos/regs-decon7.h
+@@ -45,6 +45,11 @@
+ #define VCLKCON1_CLKVAL_NUM_VCLK(val)		(((val) & 0xff) << 0)
+ #define VCLKCON2				0x18
+ 
++/* WINCHMAP0: DMA channel of each window, 4 bits per window */
++#define WINCHMAP0				0x40
++#define WINCHMAP_MASK(_win)			(0x7 << ((_win) * 4))
++#define WINCHMAP_DMA(_ch, _win)			((_ch) << ((_win) * 4))
++
+ /* SHADOWCON */
+ #define SHADOWCON				0x30
+ 

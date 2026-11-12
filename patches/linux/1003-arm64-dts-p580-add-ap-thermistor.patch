@@ -1,0 +1,60 @@
+From: Halhadus <eneshakan45@proton.me>
+Subject: [PATCH] arm64: dts: exynos: p580: describe the ADC0 AP thermistor
+
+Use the P580 common downstream ADC0 table, not the ADC1 battery table.
+Expose temperature without inventing cooling maps or shutdown thresholds.
+Source: Valera1978/android_kernel_samsung_exynos7870
+fd083ee596be966b36d0e6a027f18118fd3a5202,
+arch/arm64/boot/dts/exynos7870-gtanotexl_common.dtsi.
+
+Signed-off-by: Halhadus <eneshakan45@proton.me>
+---
+diff --git a/arch/arm64/boot/dts/exynos/exynos7870-gtanotexlwifi.dts b/arch/arm64/boot/dts/exynos/exynos7870-gtanotexlwifi.dts
+--- a/arch/arm64/boot/dts/exynos/exynos7870-gtanotexlwifi.dts
++++ b/arch/arm64/boot/dts/exynos/exynos7870-gtanotexlwifi.dts
+@@ -1905,3 +1905,45 @@
+ 		};
+ 	};
+ };
++
++/* AP thermistor on ADC0; P580 vendor table in milliCelsius, descending ADC. */
++/ {
++	ap_thermistor: thermal-sensor-ap {
++		compatible = "generic-adc-thermal";
++		#thermal-sensor-cells = <0>;
++		io-channels = <&adc 0>;
++		io-channel-names = "sensor-channel";
++		temperature-lookup-table =
++			<(-20000) 3570>,
++			<(-15000) 3475>,
++			<(-10000) 3357>,
++			<(-5000) 3218>,
++			<0 3047>,
++			<5000 2880>,
++			<10000 2679>,
++			<15000 2462>,
++			<20000 2235>,
++			<25000 2009>,
++			<30000 1786>,
++			<35000 1565>,
++			<40000 1358>,
++			<45000 1184>,
++			<50000 1018>,
++			<55000 872>,
++			<60000 740>,
++			<65000 628>,
++			<70000 527>,
++			<75000 447>,
++			<80000 379>,
++			<85000 303>,
++			<90000 250>;
++	};
++
++	thermal-zones {
++		ap-thermal {
++			polling-delay = <10000>;
++			polling-delay-passive = <0>;
++			thermal-sensors = <&ap_thermistor>;
++		};
++	};
++};

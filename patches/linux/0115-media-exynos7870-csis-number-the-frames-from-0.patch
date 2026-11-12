@@ -1,0 +1,51 @@
+From f6b49e4056410d67f6a67a715e7fe3c4dc304bb4 Mon Sep 17 00:00:00 2001
+From: Alessandro Fontana <alessandro.fontana@pm.me>
+Date: Thu, 15 Oct 2026 17:24:58 +0200
+Subject: [PATCH] media: exynos7870-csis: number the frames from 0
+
+V4L2 numbers the frames of a stream from 0, and libcamera relies on it:
+it takes the sequence of the first buffer as 0, while the frame sync
+events keep the driver's numbers. The driver counted from 1, so the
+sensor controls libcamera applied at each frame start were one frame
+off from the buffers they were reported for.
+
+Number both from 0: the event of a frame carries the count of frames
+started before it, and its buffer the same number.
+
+Assisted-by: LLM
+Signed-off-by: Alessandro Fontana <alessandro.fontana@pm.me>
+---
+ .../samsung/exynos7870-csis/exynos7870-csis.c         | 11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/media/platform/samsung/exynos7870-csis/exynos7870-csis.c b/drivers/media/platform/samsung/exynos7870-csis/exynos7870-csis.c
+index f97007a3f0..fcc21d9c43 100644
+--- a/drivers/media/platform/samsung/exynos7870-csis/exynos7870-csis.c
++++ b/drivers/media/platform/samsung/exynos7870-csis/exynos7870-csis.c
+@@ -239,7 +239,8 @@ static void csis_buffer_done(struct csis *csis, struct csis_buffer *buf,
+ 			     enum vb2_buffer_state state)
+ {
+ 	buf->vb.vb2_buf.timestamp = ktime_get_ns();
+-	buf->vb.sequence = csis->sequence;
++	/* The frame that ends here is the last one started, numbered from 0. */
++	buf->vb.sequence = csis->sequence - 1;
+ 	buf->vb.field = V4L2_FIELD_NONE;
+ 	vb2_buffer_done(&buf->vb.vb2_buf, state);
+ }
+@@ -273,12 +274,12 @@ static irqreturn_t csis_irq(int irq, void *data)
+ 			.type = V4L2_EVENT_FRAME_SYNC,
+ 		};
+ 
+-		csis->sequence++;
+ 		/*
+-		 * The sequence the buffer of this frame will carry: the
+-		 * sensor controls are applied at frame boundaries against it.
++		 * The sequence the buffer of this frame will carry, from 0 as
++		 * V4L2 wants: the sensor controls are applied at frame
++		 * boundaries against it.
+ 		 */
+-		ev.u.frame_sync.frame_sequence = csis->sequence;
++		ev.u.frame_sync.frame_sequence = csis->sequence++;
+ 		v4l2_event_queue(&csis->vdev, &ev);
+ 	}
+ 

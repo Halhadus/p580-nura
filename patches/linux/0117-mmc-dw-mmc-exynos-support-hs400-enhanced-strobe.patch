@@ -1,0 +1,87 @@
+From e92abfabe400ed3eefe3e43b151df6499f7eb646 Mon Sep 17 00:00:00 2001
+From: Alessandro Fontana <alessandro.fontana@pm.me>
+Date: Wed, 28 Oct 2026 11:11:34 +0100
+Subject: [PATCH] mmc: dw_mmc-exynos: support HS400 enhanced strobe
+
+In HS400 the controller already samples read data on the card's data
+strobe; with enhanced strobe the card also clocks its responses on it,
+and RESP_RCLK_MODE (bit 5 of HS400_DQS_EN) makes the controller latch
+them there instead of at the tuned sample phase. Set the bit while
+ios->enhanced_strobe is set and implement the new dw_mmc hook, so the
+core can switch the mode on and off. The vendor kernel for Exynos7870
+programs the same bit for its HS400ES timing.
+
+Assisted-by: LLM
+Signed-off-by: Alessandro Fontana <alessandro.fontana@pm.me>
+---
+ drivers/mmc/host/dw_mmc-exynos.c | 16 ++++++++++++++--
+ drivers/mmc/host/dw_mmc-exynos.h |  1 +
+ 2 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/mmc/host/dw_mmc-exynos.c b/drivers/mmc/host/dw_mmc-exynos.c
+index 1e906b9c5a..71c01bff2d 100644
+--- a/drivers/mmc/host/dw_mmc-exynos.c
++++ b/drivers/mmc/host/dw_mmc-exynos.c
+@@ -293,9 +293,11 @@ static int dw_mci_exynos_resume_noirq(struct device *dev)
+ 	return 0;
+ }
+ 
+-static void dw_mci_exynos_config_hs400(struct dw_mci *host, u32 timing)
++static void dw_mci_exynos_config_hs400(struct dw_mci *host,
++				       struct mmc_ios *ios)
+ {
+ 	struct dw_mci_exynos_priv_data *priv = host->priv;
++	u32 timing = ios->timing;
+ 	u32 dqs, strobe;
+ 
+ 	/*
+@@ -326,6 +328,9 @@ static void dw_mci_exynos_config_hs400(struct dw_mci *host, u32 timing)
+ 			dqs |= TXDT_CRC_TIMER_SET(priv->txdt_crc_fastlimit,
+ 						  priv->txdt_crc_initval);
+ 		}
++		/* with enhanced strobe, responses are latched on the strobe too */
++		if (ios->enhanced_strobe)
++			dqs |= RESP_RCLK_MODE;
+ 	} else if (timing == MMC_TIMING_UHS_SDR104) {
+ 		dqs &= 0xffffff00;
+ 	} else {
+@@ -404,12 +409,18 @@ static void dw_mci_exynos_set_ios(struct dw_mci *host, struct mmc_ios *ios)
+ 	dw_mci_exynos_set_clksel_timing(host, clksel);
+ 
+ 	/* Configure setting for HS400 */
+-	dw_mci_exynos_config_hs400(host, timing);
++	dw_mci_exynos_config_hs400(host, ios);
+ 
+ 	/* Configure clock rate */
+ 	dw_mci_exynos_adjust_clock(host, wanted);
+ }
+ 
++static void dw_mci_exynos_hs400_enhanced_strobe(struct dw_mci *host,
++						struct mmc_ios *ios)
++{
++	dw_mci_exynos_config_hs400(host, ios);
++}
++
+ static int dw_mci_exynos_parse_dt(struct dw_mci *host)
+ {
+ 	struct dw_mci_exynos_priv_data *priv;
+@@ -682,6 +693,7 @@ static const struct dw_mci_drv_data exynos_drv_data = {
+ 	.parse_dt		= dw_mci_exynos_parse_dt,
+ 	.execute_tuning		= dw_mci_exynos_execute_tuning,
+ 	.prepare_hs400_tuning	= dw_mci_exynos_prepare_hs400_tuning,
++	.hs400_enhanced_strobe	= dw_mci_exynos_hs400_enhanced_strobe,
+ };
+ 
+ static const struct dw_mci_drv_data artpec_drv_data = {
+diff --git a/drivers/mmc/host/dw_mmc-exynos.h b/drivers/mmc/host/dw_mmc-exynos.h
+index 1673942938..97e99c1e87 100644
+--- a/drivers/mmc/host/dw_mmc-exynos.h
++++ b/drivers/mmc/host/dw_mmc-exynos.h
+@@ -32,6 +32,7 @@
+ 
+ /* RCLK_EN register defines */
+ #define DATA_STROBE_EN			BIT(0)
++#define RESP_RCLK_MODE			BIT(5)
+ #define AXI_NON_BLOCKING_WR	BIT(7)
+ #define TXDT_CRC_TIMER_FASTLIMIT(x)	(((x) & 0xFF) << 16)
+ #define TXDT_CRC_TIMER_INITVAL(x)	(((x) & 0xFF) << 8)

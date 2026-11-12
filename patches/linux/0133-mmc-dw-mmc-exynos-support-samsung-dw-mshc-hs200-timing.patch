@@ -1,0 +1,52 @@
+From f9e9f29b49feacf3ca084bf65468ec3c1b3a3470 Mon Sep 17 00:00:00 2001
+From: Alessandro Fontana <alessandro.fontana@pm.me>
+Date: Mon, 2 Nov 2026 14:19:08 +0100
+Subject: [PATCH] mmc: dw_mmc-exynos: support samsung,dw-mshc-hs200-timing
+
+Program the HS200 phases from samsung,dw-mshc-hs200-timing when the
+property is present, keeping the tuned sample phase, and the SDR timing
+otherwise, as before.
+
+Assisted-by: LLM
+Signed-off-by: Alessandro Fontana <alessandro.fontana@pm.me>
+---
+ drivers/mmc/host/dw_mmc-exynos.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/drivers/mmc/host/dw_mmc-exynos.c b/drivers/mmc/host/dw_mmc-exynos.c
+index 0e0c1472a8..8c6b184049 100644
+--- a/drivers/mmc/host/dw_mmc-exynos.c
++++ b/drivers/mmc/host/dw_mmc-exynos.c
+@@ -39,6 +39,7 @@ struct dw_mci_exynos_priv_data {
+ 	u8				ciu_div;
+ 	u32				sdr_timing;
+ 	u32				ddr_timing;
++	u32				hs200_timing;	/* 0: use sdr_timing */
+ 	u32				hs400_timing;
+ 	u32				tuned_sample;
+ 	u32				cur_speed;
+@@ -386,6 +387,13 @@ static void dw_mci_exynos_set_ios(struct dw_mci *host, struct mmc_ios *ios)
+ 				priv->hs400_timing, priv->tuned_sample);
+ 		wanted <<= 1;
+ 		break;
++	case MMC_TIMING_MMC_HS200:
++		if (priv->hs200_timing)
++			clksel = SDMMC_CLKSEL_UP_SAMPLE(priv->hs200_timing,
++							priv->tuned_sample);
++		else
++			clksel = priv->sdr_timing;
++		break;
+ 	case MMC_TIMING_MMC_DDR52:
+ 		clksel = priv->ddr_timing;
+ 		/* Should be double rate for DDR mode */
+@@ -472,6 +480,10 @@ static int dw_mci_exynos_parse_dt(struct dw_mci *host)
+ 	priv->hs400_timing = SDMMC_CLKSEL_TIMING(timing[0], timing[1],
+ 						HS400_FIXED_CIU_CLK_DIV);
+ 
++	if (!of_property_read_u32_array(np, "samsung,dw-mshc-hs200-timing",
++					timing, 2))
++		priv->hs200_timing = SDMMC_CLKSEL_TIMING(timing[0], timing[1], div);
++
+ 	of_property_read_u32(np, "samsung,dw-mshc-txdt-crc-timer-fastlimit",
+ 			     &priv->txdt_crc_fastlimit);
+ 	of_property_read_u32(np, "samsung,dw-mshc-txdt-crc-timer-initval",

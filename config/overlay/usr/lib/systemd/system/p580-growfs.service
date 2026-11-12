@@ -1,0 +1,9 @@
+[Unit]
+Description=Grow P580 ext4 root filesystem within existing USERDATA partition
+After=systemd-remount-fs.service
+ConditionPathExists=!/var/lib/p580-grown
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/p580-growfs
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,101 @@
+From 8c208215916a03cabcbcc2af6b83ffdd5e96539d Mon Sep 17 00:00:00 2001
+From: Alessandro Fontana <alessandro.fontana@pm.me>
+Date: Thu, 17 Sep 2026 17:06:55 +0200
+Subject: [PATCH] drm/exynos: decon7: disable the windows across suspend and
+ resume
+
+decon_atomic_disable() states its own requirement in a comment: every
+window has to be disabled before the connector is suspended, or the
+block may later scan out of a destroyed buffer. It does not meet it,
+and the resume path does not make up for it either, so DECON can fetch
+from a framebuffer that userspace has since released and the SysMMU
+fault handler panics a few seconds after the panel wakes up:
+
+  exynos-sysmmu 14860000.iommu: 14830000.display-controller: [READ]
+  PAGE FAULT occurred at 0xf20061c0
+  Kernel panic - not syncing: Unrecoverable System MMU Fault!
+
+On suspend, decon_disable_plane() asserts the shadow protection of the
+window, clears WINCONx_ENWIN, asks for a standalone update and leaves
+the protection asserted. On the commit path decon_atomic_flush()
+releases it right afterwards, but an atomic disable is not followed by
+a flush: the ENWIN clear never reaches the shadow registers and
+pm_runtime_put_sync() follows without waiting for the frame in flight.
+Release the protection, ask for the update and wait for the vsync that
+makes the disable effective before the clocks go, which is what
+decon_clear_channels() already does for the channels it finds enabled
+at probe.
+
+On resume, decon_init() resets the block but the reset does not clear
+the per-window configuration: whatever WINCONx_ENWIN and VIDWxxADD0 the
+block had before the suspend are latched again when
+decon_atomic_flush() releases the protection of every window and starts
+the scanout. Clear ENWIN on every window after the reset; the scanout
+is still off there, so no vsync wait is needed.
+
+Assisted-by: LLM
+Signed-off-by: Alessandro Fontana <alessandro.fontana@pm.me>
+---
+ drivers/gpu/drm/exynos/exynos7_drm_decon.c | 35 ++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+
+diff --git a/drivers/gpu/drm/exynos/exynos7_drm_decon.c b/drivers/gpu/drm/exynos/exynos7_drm_decon.c
+index f34f344508..0485b731d0 100644
+--- a/drivers/gpu/drm/exynos/exynos7_drm_decon.c
++++ b/drivers/gpu/drm/exynos/exynos7_drm_decon.c
+@@ -714,6 +714,24 @@ static void decon_init(struct decon_context *ctx)
+ 		val |= WINCHMAP_DMA(win, win);
+ 	}
+ 	writel(val, ctx->regs + WINCHMAP0);
++
++	/*
++	 * The reset does not clear the per-window configuration: do it here
++	 * so that a window left enabled before the suspend cannot be latched
++	 * again by decon_atomic_flush(), pointing at a buffer that userspace
++	 * has since released.
++	 */
++	for (win = 0; win < WINDOWS_NR; win++) {
++		decon_shadow_protect_win(ctx, win, true);
++		val = readl(ctx->regs + WINCON(win));
++		val &= ~WINCONx_ENWIN;
++		writel(val, ctx->regs + WINCON(win));
++		decon_shadow_protect_win(ctx, win, false);
++	}
++
++	val = readl(ctx->regs + DECON_UPDATE);
++	val |= DECON_UPDATE_STANDALONE_F;
++	writel(val, ctx->regs + DECON_UPDATE);
+ }
+ 
+ static void decon_atomic_enable(struct exynos_drm_crtc *crtc)
+@@ -741,6 +759,7 @@ static void decon_atomic_enable(struct exynos_drm_crtc *crtc)
+ static void decon_atomic_disable(struct exynos_drm_crtc *crtc)
+ {
+ 	struct decon_context *ctx = crtc->ctx;
++	u32 val;
+ 	int i;
+ 
+ 	/*
+@@ -751,6 +770,22 @@ static void decon_atomic_disable(struct exynos_drm_crtc *crtc)
+ 	for (i = 0; i < WINDOWS_NR; i++)
+ 		decon_disable_plane(crtc, &ctx->planes[i]);
+ 
++	/*
++	 * decon_disable_plane() leaves the shadow protected: on the commit
++	 * path decon_atomic_flush() releases it, but nothing flushes after
++	 * an atomic disable, so without this the clear above never reaches
++	 * the shadow registers and the block keeps the old buffers.
++	 */
++	for (i = 0; i < WINDOWS_NR; i++)
++		decon_shadow_protect_win(ctx, i, false);
++
++	val = readl(ctx->regs + DECON_UPDATE);
++	val |= DECON_UPDATE_STANDALONE_F;
++	writel(val, ctx->regs + DECON_UPDATE);
++
++	/* Disabling a channel only takes effect at the next vsync. */
++	decon_wait_for_vblank(ctx);
++
+ 	ctx->scanout_on = false;
+ 
+ 	pm_runtime_put_sync(ctx->dev);

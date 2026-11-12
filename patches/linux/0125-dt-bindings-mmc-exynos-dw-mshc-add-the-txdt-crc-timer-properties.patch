@@ -1,0 +1,41 @@
+From 135a5fab162e616aac8b173452d0392ecfecbfc2 Mon Sep 17 00:00:00 2001
+From: Alessandro Fontana <alessandro.fontana@pm.me>
+Date: Thu, 29 Oct 2026 08:54:11 +0100
+Subject: [PATCH] dt-bindings: mmc: exynos-dw-mshc: add the TXDT CRC timer
+ properties
+
+The driver reads samsung,dw-mshc-txdt-crc-timer-fastlimit and -initval,
+the write CRC status timer it programs in HS400 mode, but the binding did
+not describe them and device trees using them failed the schema check.
+
+Assisted-by: LLM
+Signed-off-by: Alessandro Fontana <alessandro.fontana@pm.me>
+---
+ .../bindings/mmc/samsung,exynos-dw-mshc.yaml       | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/mmc/samsung,exynos-dw-mshc.yaml b/Documentation/devicetree/bindings/mmc/samsung,exynos-dw-mshc.yaml
+index d37884fd21..b91a0a3b41 100644
+--- a/Documentation/devicetree/bindings/mmc/samsung,exynos-dw-mshc.yaml
++++ b/Documentation/devicetree/bindings/mmc/samsung,exynos-dw-mshc.yaml
+@@ -113,6 +113,20 @@ properties:
+       RCLK (Data strobe) delay to control HS400 mode (Latency value for delay
+       line in Read path). If missing, default from hardware is used.
+ 
++  samsung,dw-mshc-txdt-crc-timer-fastlimit:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    maximum: 0xff
++    description:
++      Fast limit of the write CRC status timer, programmed in HS400 mode.
++      If neither this nor samsung,dw-mshc-txdt-crc-timer-initval is given,
++      the timer is left as the bootloader set it.
++
++  samsung,dw-mshc-txdt-crc-timer-initval:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    maximum: 0xff
++    description:
++      Initial value of the write CRC status timer, programmed in HS400 mode.
++
+   samsung,hs400-enhanced-strobe-only:
+     type: boolean
+     description:

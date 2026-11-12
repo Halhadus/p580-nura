@@ -1,0 +1,68 @@
+From f733d0d244e934c11909360be7d6903fcb6f04f8 Mon Sep 17 00:00:00 2001
+From: Alessandro Fontana <alessandro.fontana@pm.me>
+Date: Wed, 28 Oct 2026 11:11:13 +0100
+Subject: [PATCH] mmc: dw_mmc: let implementations enable HS400 enhanced strobe
+
+The core asks the host to switch enhanced strobe on and off through
+mmc_host_ops.hs400_enhanced_strobe, but dw_mmc does not provide it, so
+no dw_mmc implementation can run a card in HS400ES. Forward the call to
+a new optional hs400_enhanced_strobe hook in dw_mci_drv_data, as is
+already done for prepare_hs400_tuning.
+
+Assisted-by: LLM
+Signed-off-by: Alessandro Fontana <alessandro.fontana@pm.me>
+---
+ drivers/mmc/host/dw_mmc.c | 11 +++++++++++
+ drivers/mmc/host/dw_mmc.h |  3 +++
+ 2 files changed, 14 insertions(+)
+
+diff --git a/drivers/mmc/host/dw_mmc.c b/drivers/mmc/host/dw_mmc.c
+index fb469aba2f..1325539ac7 100644
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@ -1600,6 +1600,16 @@ static int dw_mci_prepare_hs400_tuning(struct mmc_host *mmc,
+ 	return 0;
+ }
+ 
++static void dw_mci_hs400_enhanced_strobe(struct mmc_host *mmc,
++					 struct mmc_ios *ios)
++{
++	struct dw_mci *host = mmc_priv(mmc);
++	const struct dw_mci_drv_data *drv_data = host->drv_data;
++
++	if (drv_data && drv_data->hs400_enhanced_strobe)
++		drv_data->hs400_enhanced_strobe(host, ios);
++}
++
+ static bool dw_mci_reset(struct dw_mci *host)
+ {
+ 	u32 flags = SDMMC_CTRL_RESET | SDMMC_CTRL_FIFO_RESET;
+@@ -1681,6 +1691,7 @@ static const struct mmc_host_ops dw_mci_ops = {
+ 	.card_busy		= dw_mci_card_busy,
+ 	.start_signal_voltage_switch = dw_mci_switch_voltage,
+ 	.prepare_hs400_tuning	= dw_mci_prepare_hs400_tuning,
++	.hs400_enhanced_strobe	= dw_mci_hs400_enhanced_strobe,
+ };
+ 
+ #ifdef CONFIG_FAULT_INJECTION
+diff --git a/drivers/mmc/host/dw_mmc.h b/drivers/mmc/host/dw_mmc.h
+index 38610c89d5..b7e38e0de5 100644
+--- a/drivers/mmc/host/dw_mmc.h
++++ b/drivers/mmc/host/dw_mmc.h
+@@ -516,6 +516,7 @@ extern int dw_mci_runtime_resume(struct device *device);
+  * @set_ios: handle bus specific extensions.
+  * @parse_dt: parse implementation specific device tree properties.
+  * @execute_tuning: implementation specific tuning procedure.
++ * @hs400_enhanced_strobe: enable or disable HS400 enhanced strobe.
+  * @set_data_timeout: implementation specific timeout.
+  * @get_drto_clks: implementation specific cycle count for data read timeout.
+  * @hw_reset: implementation specific HW reset.
+@@ -534,6 +535,8 @@ struct dw_mci_drv_data {
+ 	int		(*execute_tuning)(struct dw_mci *host, u32 opcode);
+ 	int		(*prepare_hs400_tuning)(struct dw_mci *host,
+ 						struct mmc_ios *ios);
++	void		(*hs400_enhanced_strobe)(struct dw_mci *host,
++						 struct mmc_ios *ios);
+ 	int		(*switch_voltage)(struct dw_mci *host,
+ 					  struct mmc_ios *ios);
+ 	void		(*set_data_timeout)(struct dw_mci *host,

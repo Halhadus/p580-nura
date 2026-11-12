@@ -1,0 +1,75 @@
+From da09c1fa0a8d8e5dd0614361be44ec8318b04b55 Mon Sep 17 00:00:00 2001
+From: Alessandro Fontana <alessandro.fontana@pm.me>
+Date: Fri, 14 Aug 2026 17:00:00 +0000
+Subject: [PATCH] extcon: sm5502: resolve coalesced attach/detach from the
+ hardware state
+
+sm5502_muic_irq_work() acts on the irq_attach and irq_detach flags in
+sequence.  When both are set in the same run of the work item, which
+happens whenever an attach and a detach interrupt are serviced in the
+same batch, the attach handler publishes the cable state and the detach
+handler immediately clears it again.  The extcon device then reports no
+cable while one is plugged in, so a charger driver consuming the extcon
+notifier falls back to its most conservative input current limit until
+the next cable cycle.  On a Galaxy Tab A (SM-T580) DEV_TYPE1 reads 0x20
+(USB SDP) while extcon reports USB=0 SDP=0 DCP=0.
+
+When both flags are set, ask the hardware instead of replaying them:
+sm5502_muic_get_cable_type() reads ADC and DEV_TYPE1 and returns a
+negative value when no cable can be identified, so a coalesced pair
+resolves to whatever is actually plugged in.
+
+A lone flag is still taken at face value.  The work item runs some
+milliseconds after the interrupt, and by then the chip may still report
+the cable it has just lost: re-reading the hardware for a lone detach
+would turn it into an attach, leaving for instance CDP=1 reported
+indefinitely after the cable is pulled.
+
+Assisted-by: LLM
+Signed-off-by: Alessandro Fontana <alessandro.fontana@pm.me>
+---
+ drivers/extcon/extcon-sm5502.c | 27 +++++++++++++++++++++------
+ 1 file changed, 21 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/extcon/extcon-sm5502.c b/drivers/extcon/extcon-sm5502.c
+index c8c4b9ef72..e10b05eb69 100644
+--- a/drivers/extcon/extcon-sm5502.c
++++ b/drivers/extcon/extcon-sm5502.c
+@@ -531,16 +531,31 @@ static void sm5502_muic_irq_work(struct work_struct *work)
+ 
+ 	mutex_lock(&info->mutex);
+ 
+-	/* Detect attached or detached cables */
+-	if (info->irq_attach) {
++	/*
++	 * Detect attached or detached cables.
++	 *
++	 * Both flags can be set in the same run, in which case replaying them
++	 * in order would leave the state of whichever came last.  Ask the
++	 * hardware instead: a negative return means nothing identifiable is
++	 * connected.  A single flag is taken as it is, because by the time
++	 * this runs the chip may still be reporting a cable that has just
++	 * been unplugged.
++	 */
++	if (info->irq_attach && info->irq_detach) {
++		bool attached;
++
++		attached = sm5502_muic_get_cable_type(info) >= 0;
++
++		ret = sm5502_muic_cable_handler(info, attached);
++	} else if (info->irq_attach) {
+ 		ret = sm5502_muic_cable_handler(info, true);
+-		info->irq_attach = false;
+-	}
+-	if (info->irq_detach) {
++	} else if (info->irq_detach) {
+ 		ret = sm5502_muic_cable_handler(info, false);
+-		info->irq_detach = false;
+ 	}
+ 
++	info->irq_attach = false;
++	info->irq_detach = false;
++
+ 	if (ret < 0)
+ 		dev_err(info->dev, "failed to handle MUIC interrupt\n");
+ 

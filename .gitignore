@@ -1,0 +1,8 @@
+/work/
+/out/
+/cache/
+/backup/
+/device-info/
+__pycache__/
+*.py[cod]
+*.part

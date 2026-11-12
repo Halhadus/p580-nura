@@ -1,0 +1,39 @@
+From a5c6093d9402dd88f96b2bd559be97a9e3fb7ce1 Mon Sep 17 00:00:00 2001
+From: Matt Sullivan <1115325+matt-sullivan@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 00:53:53 +0000
+Subject: [PATCH] power: supply: sm5703-charger: Enable input current
+ regulation
+
+The input current limits rely on AICL to back off when the adapter
+cannot keep up, but the driver never enables it, so set it explicitly
+rather than depend on the bootloader.
+
+Assisted-by: LLM
+Signed-off-by: Matt Sullivan <1115325+matt-sullivan@users.noreply.github.com>
+---
+ drivers/power/supply/sm5703-charger.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/drivers/power/supply/sm5703-charger.c b/drivers/power/supply/sm5703-charger.c
+index 5423a766fa..d71dbdfb66 100644
+--- a/drivers/power/supply/sm5703-charger.c
++++ b/drivers/power/supply/sm5703-charger.c
+@@ -410,6 +410,18 @@ static int sm5703_charger_configure(struct sm5703_charger *chg)
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * Input current regulation: when a USB port or adapter cannot supply
++	 * enough current to meet the current limit, VBUS will sag.  Hold the
++	 * input current down rather than let the supply collapse.  The input
++	 * current limits rely on this, so do not depend on the bootloader
++	 * having enabled it.
++	 */
++	ret = regmap_set_bits(chg->regmap, SM5703_REG_CHGCNTL5,
++			      SM5703_CHGCNTL5_AICLEN);
++	if (ret)
++		return ret;
++
+ 	ret = regmap_update_bits(chg->regmap, SM5703_REG_CHGCNTL6,
+ 				 SM5703_CHGCNTL6_FREQSEL,
+ 				 FIELD_PREP(SM5703_CHGCNTL6_FREQSEL,
