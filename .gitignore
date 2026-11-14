@@ -1,8 +1,8 @@
 /work/
 /out/
-/cache/
 /backup/
-/device-info/
+/pmbootstrap.cfg
+/pmbootstrap.cfg.old
 __pycache__/
 *.py[cod]
 *.part

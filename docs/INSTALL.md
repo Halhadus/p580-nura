@@ -2,64 +2,54 @@
 
 ## Requirements
 
-- Samsung SM-P580 with TWRP installed.
-- Debian arm64 computer and a USB cable.
-- USB debugging enabled and the computer authorized in Android.
-- Root ADB access (`adb root`) or working `su`. Without either, the device check requires SELinux `Permissive` and readable firmware files.
+- Samsung SM-P580 with a working P580 TWRP recovery.
+- Linux build computer, ADB and a USB cable.
+- Completed `./port.sh build` and enough free storage for backups.
 
-## Prepare and install
+**Installation overwrites BOOT and USERDATA, including apps, settings and internal storage.** Keep external copies of the backups.
 
-With Android running:
+## Backup
+
+Open TWRP, disable MTP and unmount Data. Then run:
 
 ```sh
-./port.sh deps
-./port.sh prepare
+./port.sh backup
+```
+
+The backup contains BOOT, RECOVERY, EFS and USERDATA with raw-data sizes and SHA256 digests. It also records model, serial, eMMC CID and partition layout. An interrupted backup can be resumed by rerunning the command.
+
+To omit Android user data:
+
+```sh
+./port.sh backup --skip-userdata
+```
+
+BOOT, RECOVERY and EFS are still backed up. A skipped USERDATA backup provides no restore point for Android apps, settings or internal storage.
+
+## Install
+
+```sh
 ./port.sh install --erase-android-data
 adb reboot
 ```
 
-Preparation reads the device identity and firmware, builds the images, reboots into TWRP and backs up BOOT, RECOVERY, EFS and USERDATA. It then requests a password for the `mobian` account and creates the rootfs.
-
-**Installation erases Android apps, settings and files, including internal storage.** Keep `backup/` on another disk. Writes are verified by SHA256 readback; RECOVERY/TWRP, EFS and the partition table are preserved.
-
-If TWRP cannot unmount Data, disable MTP and uncheck Data in its Mount menu. Run `./port.sh finish` to resume preparation, then repeat the install command. Do not reboot after a write or readback error.
-
-## Install without a USERDATA backup
-
-Follow the separate [build steps](BUILD.md), using these backup and install commands:
+If USERDATA was omitted from the backup, explicitly use the same choice:
 
 ```sh
-./port.sh backup --skip-userdata
-./port.sh rootfs
-./port.sh verify
 ./port.sh install --erase-android-data --skip-userdata
 adb reboot
 ```
 
-This still backs up BOOT, RECOVERY and EFS. Android apps, settings and files cannot be restored without the USERDATA backup.
+The installer checks the backup against the connected tablet and validates the images before writing USERDATA and BOOT. Images are staged in RAM in chunks of up to 64 MiB; each chunk is checked by SHA256 before writing. Both images are verified by SHA256 readback.
+
+If a transfer or readback fails, remain in TWRP. After fixing the connection, rerun the same install command; an image whose readback already matches is skipped. Never issue a reboot after a failed verification.
 
 ## First boot
 
-Sign in as `mobian` using the password chosen during preparation. Connect Wi-Fi from Settings.
+Use the account and password chosen by pmbootstrap. The tablet normally uses `172.16.42.1` over USB networking, with the computer receiving another address in that subnet. Use the selected username for SSH.
 
-For SSH over USB, run on the computer:
+Automatic suspend is disabled. The power button shuts down the tablet; cover events are ignored.
 
-```sh
-bash scripts/usb-host.sh
-ssh mobian@10.77.0.2
-```
+## Recovery
 
-The computer uses `10.77.0.1/24`; the tablet uses `10.77.0.2/24`.
-
-## Restore Android
-
-Open TWRP with Volume Up + Home + Power, connect USB and use the complete Android backup:
-
-```sh
-./port.sh restore --restore-android-data
-adb reboot
-```
-
-This replaces Mobian with the backed-up Android BOOT and USERDATA. EFS and TWRP remain untouched.
-
-For recovery after a failed boot, open TWRP and run `./port.sh logs`. Logs are saved under `out/device-logs/`.
+Open TWRP with Volume Up + Home + Power. BOOT and USERDATA backups can be restored manually from recovery after checking their recorded sizes/digests and confirming the target partitions. Keep `backup/index.json` with the image files.

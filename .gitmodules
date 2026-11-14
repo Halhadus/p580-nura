@@ -1,0 +1,4 @@
+[submodule "pmaports"]
+	path = pmaports
+	url = git@github.com:Halhadus/pmaports.git
+	branch = p580-nura
